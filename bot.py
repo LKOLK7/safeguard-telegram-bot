@@ -20,7 +20,7 @@ from starlette.routing import Route
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # used to verify incoming webhook requests
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "https://safeguard-telegram-bot.onrender.com")  # used to verify incoming webhook requests
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render sets this automatically
 WEBHOOK_PATH = "/webhook"                                    # endpoint path on our server
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""  # full HTTPS URL for Telegram
