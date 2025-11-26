@@ -20,20 +20,20 @@ from starlette.routing import Route
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # verify incoming webhook requests
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # set by Render
-WEBHOOK_PATH = "/webhook"
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # used to verify incoming webhook requests
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render sets this automatically
+WEBHOOK_PATH = "/webhook"                                    # endpoint path on our server
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""  # full HTTPS URL for Telegram
 
-# Safeguard policies (customize)
-BAD_WORDS = {"idiot", "stupid", "fool"}
+# Safeguard policies (customize as needed)
+BAD_WORDS = {"idiot", "stupid", "fool"}  # example list; add your own
 BLOCK_LINKS = True
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
-MUTE_SECONDS = 60
+MUTE_SECONDS = 60  # temporary mute duration
 
-# In-memory state
+# In-memory state (replace with DB if you need persistence)
 PENDING_CAPTCHA = {}           # user_id -> {"chat_id": ..., "answer": ...}
 USER_WARNINGS = {}             # (chat_id, user_id) -> count
 USER_MSG_TIMES = {}            # (chat_id, user_id) -> [timestamps]
@@ -54,7 +54,7 @@ async def delete_message_safe(update: Update, context: ContextTypes.DEFAULT_TYPE
         pass
 
 async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, seconds: int = MUTE_SECONDS):
-    # Requires bot admin rights with "Restrict Members". 
+    # Requires bot to be admin with "Restrict Members" right.
     perms = ChatPermissions(can_send_messages=False, can_send_media_messages=False,
                             can_send_polls=False, can_add_web_page_previews=False)
     until_date = datetime.now() + timedelta(seconds=seconds)
@@ -266,7 +266,7 @@ async def root(request: Request):
     return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request):
-    # Verify secret token header from Telegram when set_webhook(..., secret_token=WEBHOOK_SECRET)
+    # Verify secret token header from Telegram (set via set_webhook(..., secret_token=WEBHOOK_SECRET))
     if WEBHOOK_SECRET:
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
