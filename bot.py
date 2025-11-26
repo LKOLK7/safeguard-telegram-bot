@@ -1,13 +1,31 @@
 
+#!/usr/bin/env python
+# bot.py — Safeguard Telegram Bot (Render-ready, webhook + healthz)
+#
+# Features:
+# - Content moderation (banned words, link blocking)
+# - Flood control (rate-limit users; temporary mute)
+# - New-member CAPTCHA verification
+# - New-member alert (id/is_bot/names/username link/language_code)
+# - Admin policy controls (/addbadword, /removebadword, /togglelinks)
+# - User commands (/start, /rules, /report, /warnings, /function)
+# - Render-compatible webhook server (Starlette) with /webhook & /healthz
+#
+# NOTES:
+# - The bot must be ADMIN in the group with "Restrict Members" rights for muting/restricting.
+# - WEBHOOK_SECRET must only use: A–Z a–z 0–9 underscore (_) and hyphen (-).
+# - Render injects PORT & RENDER_EXTERNAL_URL automatically.
+
 import os
 import re
 import random
+import logging
 from datetime import datetime, timedelta
 
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ChatMemberHandler, filters, AIORateLimiter
+    ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ChatMemberHandler, filters, AIORateLimiter
 )
 
 from starlette.applications import Starlette
@@ -16,17 +34,26 @@ from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
 # ----------------------------
+# Logging
+# ----------------------------
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO
+)
+logger = logging.getLogger("safeguard-bot")
+
+# ----------------------------
 # Environment & Config
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "https://safeguard-telegram-bot.onrender.com")  # used to verify incoming webhook requests
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # must be A-Z a-z 0-9 _ -
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render sets this automatically
 WEBHOOK_PATH = "/webhook"                                    # endpoint path on our server
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""  # full HTTPS URL for Telegram
 
 # Safeguard policies (customize as needed)
-BAD_WORDS = {"idiot", "stupid", "fool"}  # example list; add your own
+BAD_WORDS = {"idiot", "stupid", "fool"}   # example list; add your own
 BLOCK_LINKS = True
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
@@ -50,19 +77,27 @@ def contains_link(text: str) -> bool:
 async def delete_message_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await context.bot.delete_message(update.effective_chat.id, update.effective_message.message_id)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Delete message failed: {e}")
 
 async def mute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, seconds: int = MUTE_SECONDS):
-    # Requires bot to be admin with "Restrict Members" right.
-    perms = ChatPermissions(can_send_messages=False, can_send_media_messages=False,
-                            can_send_polls=False, can_add_web_page_previews=False)
+    # Requires bot admin rights with "Restrict Members".
+    perms = ChatPermissions(
+        can_send_messages=False,
+        can_send_media_messages=False,
+        can_send_polls=False,
+        can_add_web_page_previews=False
+    )
     until_date = datetime.now() + timedelta(seconds=seconds)
     await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until_date)
 
 async def unmute_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
-    perms = ChatPermissions(can_send_messages=True, can_send_media_messages=True,
-                            can_send_polls=True, can_add_web_page_previews=True)
+    perms = ChatPermissions(
+        can_send_messages=True,
+        can_send_media_messages=True,
+        can_send_polls=True,
+        can_add_web_page_previews=True
+    )
     await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms)
 
 def add_warning(chat_id: int, user_id: int) -> int:
@@ -78,13 +113,16 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     USER_MSG_TIMES[key] = [t for t in times if now - t <= FLOOD_WINDOW_SEC]
     return len(USER_MSG_TIMES[key])
 
+def secret_is_valid(token: str) -> bool:
+    return bool(re.match(r"^[A-Za-z0-9_-]{1,256}$", token))
+
 # ----------------------------
 # Commands
 # ----------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello! I keep this group safe—moderation, anti-spam, and new member verification.\n"
-        "Use /rules to see the code of conduct, or /report to alert admins."
+        "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins."
     )
 
 async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -102,14 +140,42 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Thanks—we have notified the admins.")
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(admin_id,
-                f"[REPORT] Chat {update.effective_chat.id} from @{update.effective_user.username or update.effective_user.id}: {reason}")
-        except Exception:
-            pass
+            await context.bot.send_message(
+                admin_id,
+                f"[REPORT] Chat {update.effective_chat.id} from @{update.effective_user.username or update.effective_user.id}: {reason}"
+            )
+        except Exception as e:
+            logger.debug(f"Notify admin failed: {e}")
 
 async def cmd_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
     await update.message.reply_text(f"Your current warnings: {count}")
+
+# --- /function: Show bot capabilities ----------------------------------------
+async def cmd_function(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (
+        "🔧 **Safeguard Bot Functions**\n\n"
+        "**General (Private & Group)**\n"
+        "• /start – Introduction and how to use the bot\n"
+        "• /rules – Display the group rules\n"
+        "• /report <reason> – Report an issue to admins\n"
+        "• /warnings – Show your current warning count\n\n"
+        "**Moderation (Group)**\n"
+        "• Auto‑filter offensive words (customizable)\n"
+        "• Block links (if enabled)\n"
+        "• Flood control: mute users who send too many messages too fast\n"
+        "• Delete violating messages\n\n"
+        "**Verification (Group)**\n"
+        "• New members must pass a simple CAPTCHA to chat\n\n"
+        "**Admin Controls**\n"
+        "• /addbadword <word ...> – Add banned words\n"
+        "• /removebadword <word ...> – Remove banned words\n"
+        "• /togglelinks – Enable/disable link blocking\n\n"
+        "**Notes**\n"
+        "• For muting/restricting, the bot must be **admin** with 'Restrict Members' right.\n"
+        "• In groups with Privacy Mode ON, only commands are processed unless mentioned."
+    )
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 # ----------------------------
 # Admin policy controls
@@ -185,13 +251,15 @@ async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await mute_user(chat_id, user.id, context, seconds=MUTE_SECONDS)
 
 # ----------------------------
-# New member verification (CAPTCHA)
+# New member verification + alert (CAPTCHA + details)
 # ----------------------------
 async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     for new_member in update.message.new_chat_members:
-        # initial restriction
+        # 1) Restrict new member initially (CAPTCHA gate)
         await mute_user(chat_id, new_member.id, context, seconds=MUTE_SECONDS)
+
+        # 2) Build a verification challenge
         correct = random.randint(1, 4)
         options = list(range(1, 5))
         random.shuffle(options)
@@ -200,13 +268,48 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for n in options
         ]
         PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct}
+
+        # 3) Send the verification prompt
         await context.bot.send_message(
             chat_id,
             f"👋 Welcome, @{new_member.username or new_member.first_name}!\n"
             f"Please verify: pick **{correct}** to unlock chatting.",
-            reply_markup=InlineKeyboardMarkup(keyboard)
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode="Markdown"
         )
 
+        # 4) Compose the alert with user details (exact format requested)
+        uid = new_member.id
+        is_bot = "true" if new_member.is_bot else "false"
+        first_name = new_member.first_name or "-"
+        last_name = new_member.last_name or "-"
+        uname = new_member.username or "-"
+        ulink = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
+        lang = getattr(new_member, "language_code", None) or "-"
+        lang_link = "(-)"  # keep same placeholder style
+
+        alert_text = (
+            f"id: {uid}\n"
+            f" ├ is_bot: {is_bot}\n"
+            f" ├ first_name: {first_name}\n"
+            f" ├ last_name: {last_name}\n"
+            f" ├ username: {uname} {ulink}\n"
+            f" └ language_code: {lang} {lang_link}"
+        )
+
+        # 5) Post the alert to the group
+        await context.bot.send_message(chat_id, alert_text)
+
+        # 6) (Optional) Notify admins privately as well
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(admin_id, f"[NEW MEMBER]\n{alert_text}")
+            except Exception:
+                pass
+
+# ----------------------------
+# Verify button callback
+# ----------------------------
 async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -228,33 +331,50 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             PENDING_CAPTCHA.pop(user_id, None)
         else:
             await query.edit_message_text("❌ Wrong answer. Try again.")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"verify_callback error: {e}")
 
 # ----------------------------
 # Build PTB Application (async + rate limiter)
 # ----------------------------
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in environment.")
+
 application = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
-    .rate_limiter(AIORateLimiter())  # avoids API flood limits
+    .rate_limiter(AIORateLimiter())  # avoid Telegram API flood limits
     .build()
 )
 
-# Handlers
+# Register handlers
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("rules", cmd_rules))
 application.add_handler(CommandHandler("report", cmd_report))
 application.add_handler(CommandHandler("warnings", cmd_warnings))
+application.add_handler(CommandHandler("function", cmd_function))
+
 application.add_handler(CommandHandler("addbadword", addbadword))
 application.add_handler(CommandHandler("removebadword", removebadword))
 application.add_handler(CommandHandler("togglelinks", togglelinks))
+
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate))
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
 application.add_handler(ChatMemberHandler(lambda *_: None))  # optional
+
+# Optional: set Telegram command menu
+async def set_my_commands():
+    try:
+        await application.bot.set_my_commands([
+            ("start", "Introduction"),
+            ("rules", "Show group rules"),
+            ("report", "Report an issue to admins"),
+            ("warnings", "Show your warnings"),
+            ("function", "Show all bot functions"),
+        ])
+    except Exception as e:
+        logger.debug(f"set_my_commands failed: {e}")
 
 # ----------------------------
 # Starlette Web App (webhook + health check)
@@ -267,12 +387,17 @@ async def root(request: Request):
 
 async def webhook(request: Request):
     # Verify secret token header from Telegram when set_webhook(..., secret_token=WEBHOOK_SECRET)
-    if WEBHOOK_SECRET:
+    if secret_is_valid(WEBHOOK_SECRET):
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
+            logger.warning("Forbidden webhook call: secret mismatch")
             return PlainTextResponse("forbidden", status_code=403)
 
-    data = await request.json()
+    try:
+        data = await request.json()
+    except Exception:
+        return PlainTextResponse("bad request", status_code=400)
+
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return PlainTextResponse("ok")
@@ -280,23 +405,44 @@ async def webhook(request: Request):
 routes = [
     Route("/", root, methods=["GET"]),
     Route("/healthz", healthz, methods=["GET"]),
-    Route(WEBHOOK_PATH, webhook, methods=["POST"]),  # <-- fixed: keep leading slash
+    Route(WEBHOOK_PATH, webhook, methods=["POST"]),  # /webhook
 ]
 app = Starlette(routes=routes)
 
-# Proper startup/shutdown to manage PTB lifecycle & set webhook
+# Startup/Shutdown: PTB lifecycle + webhook registration
 @app.on_event("startup")
 async def on_startup():
+    logger.info("Application starting …")
     await application.initialize()
     await application.start()
-    # Set webhook with secret token (secure)
-    if WEBHOOK_URL:
-        await application.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
+
+    # Register webhook with secret if valid; otherwise without (to avoid Telegram BadRequest)
+    try:
+        if WEBHOOK_URL:
+            if secret_is_valid(WEBHOOK_SECRET):
+                await application.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
+                logger.info(f"Webhook set to {WEBHOOK_URL} with secret.")
+            else:
+                logger.warning("WEBHOOK_SECRET invalid; setting webhook without secret.")
+                await application.bot.set_webhook(url=WEBHOOK_URL)
+                logger.info(f"Webhook set to {WEBHOOK_URL} (no secret).")
+    except Exception as e:
+        logger.error(f"set_webhook failed: {e}")
+        # Exit early so Render restarts the service and logs the error clearly
+        raise
+
+    await set_my_commands()
+    logger.info("Application started.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
+    logger.info("Application stopping …")
     await application.stop()
+    logger.info("Application stopped.")
 
+# ----------------------------
+# Main (Render: uses PORT env var)
+# ----------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))  # Render sets PORT automatically
