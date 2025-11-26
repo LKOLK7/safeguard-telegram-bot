@@ -20,7 +20,7 @@ from starlette.routing import Route
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "https://safeguard-telegram-bot.onrender.com")  # used to verify incoming webhook requests
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # used to verify incoming webhook requests
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render sets this automatically
 WEBHOOK_PATH = "/webhook"                                    # endpoint path on our server
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""  # full HTTPS URL for Telegram
@@ -239,7 +239,7 @@ if not BOT_TOKEN:
 application = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
-    .rate_limiter(AIORateLimiter())  # avoid flood limits
+    .rate_limiter(AIORateLimiter())  # avoids API flood limits
     .build()
 )
 
@@ -266,7 +266,7 @@ async def root(request: Request):
     return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request):
-    # Verify secret token header from Telegram (set via set_webhook(..., secret_token=WEBHOOK_SECRET))
+    # Verify secret token header from Telegram when set_webhook(..., secret_token=WEBHOOK_SECRET)
     if WEBHOOK_SECRET:
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
@@ -280,15 +280,16 @@ async def webhook(request: Request):
 routes = [
     Route("/", root, methods=["GET"]),
     Route("/healthz", healthz, methods=["GET"]),
-    Route(WEBHOOK_PATH.lstrip("/"), webhook, methods=["POST"]),
+    Route(WEBHOOK_PATH, webhook, methods=["POST"]),  # <-- fixed: keep leading slash
 ]
 app = Starlette(routes=routes)
 
-# Startup/Shutdown: PTB lifecycle + webhook registration
+# Proper startup/shutdown to manage PTB lifecycle & set webhook
 @app.on_event("startup")
 async def on_startup():
     await application.initialize()
     await application.start()
+    # Set webhook with secret token (secure)
     if WEBHOOK_URL:
         await application.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
 
