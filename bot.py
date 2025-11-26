@@ -47,7 +47,7 @@ logger = logging.getLogger("safeguard-bot")
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # must be A-Z a-z 0-9 _ -
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "b77604a21c955932fcb178599437aa58")  # must be A-Z a-z 0-9 _ -
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render sets this automatically
 WEBHOOK_PATH = "/webhook"                                    # endpoint path on our server
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""  # full HTTPS URL for Telegram
