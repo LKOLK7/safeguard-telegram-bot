@@ -6,7 +6,7 @@ Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal s
 Design:
 - python-telegram-bot v20 ApplicationBuilder with .updater(None) for a custom Starlette webhook
 - Startup does NOT raise on set_webhook failure (avoids "Application exited early" on Render)
-- Group diagnostics: error handler + logs in /start to pinpoint permission/context issues
+- Group diagnostics: error handler + logs in /start + a group command tap to inspect command routing
 
 Env vars:
   BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET (optional), VT_API_KEY (optional),
@@ -197,7 +197,7 @@ async def cmd_warnings(update: Update, context):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
     await update.message.reply_text(f"Your current warnings: {count}")
 
-# Quick test command
+# Quick connectivity test
 async def cmd_ping(update: Update, context):
     try:
         await update.message.reply_text("🏓 pong")
@@ -532,14 +532,17 @@ logger.info(f"python-telegram-bot: {telegram.__version__}")
 logger.info(f"RENDER_EXTERNAL_URL: {os.getenv('RENDER_EXTERNAL_URL')}")
 logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
 
-builder = ApplicationBuilder().token(BOT_TOKEN).updater(None)
+builder = ApplicationBuilder().token(BOT_TOKEN).updater(None)  # custom webhook (PTB example)
 try:
-    builder = builder.rate_limiter(AIORateLimiter())
+    builder = builder.rate_limiter(AIORateLimiter())  # optional extra installed via requirements
 except Exception as e:
     logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
 
 application = builder.build()
 bot_for_update = application.bot
+
+# Log exact bot username on startup
+BOT_USERNAME = None
 
 # Global error handler so we see permission problems in group replies
 async def on_error(update: object, context):
@@ -563,6 +566,14 @@ application.add_handler(CommandHandler("ping", cmd_ping))
 application.add_handler(CommandHandler("addbadword", addbadword))
 application.add_handler(CommandHandler("removebadword", removebadword))
 application.add_handler(CommandHandler("togglelinks", togglelinks))
+
+# --- Group command tap (logs raw command text & entities for troubleshooting) ---
+async def group_command_tap(update: Update, context):
+    msg = update.message
+    txt = msg.text or ""
+    ents = getattr(msg, "entities", None)
+    logger.info(f"GROUP COMMAND SEEN: text={txt!r}, entities={ents!r}, chat_id={update.effective_chat.id}")
+application.add_handler(MessageHandler(filters.COMMAND & group_chats_filter_v20, group_command_tap), group=1)
 
 # Moderation / join / scanners
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate))
@@ -622,6 +633,14 @@ app = Starlette(routes=routes)
 @app.on_event("startup")
 async def on_startup():
     logger.info(f"Application starting … WEBHOOK_URL={WEBHOOK_URL!r} secret_valid={secret_is_valid(WEBHOOK_SECRET)}")
+
+    # Resolve exact bot username for addressing in groups
+    try:
+        me = await application.bot.get_me()
+        BOT_USERNAME = me.username
+        logger.info(f"Bot identity: id={me.id}, username=@{BOT_USERNAME}")
+    except Exception as e:
+        logger.warning(f"get_me failed: {e}")
 
     await application.initialize()
     await application.start()
