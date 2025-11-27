@@ -4,7 +4,7 @@
 Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal scanner
 
 - PTB v20 custom webhook (.updater(None)) with Starlette.
-- Global Defaults(block=False) so multiple handlers can run per update.
+- Defaults(block=False) so multiple handlers can run per update.
 - Deletion is async + awaited everywhere.
 - Scan documents & photos in BOTH group and DM (filters.Document.ALL & filters.PHOTO).
 - New member alert (details posted to the group) on NEW_CHAT_MEMBERS.
@@ -31,6 +31,7 @@ from telegram import (
 from telegram.helpers import escape_markdown
 import telegram  # version logging
 
+# Starlette web server
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -552,8 +553,6 @@ application.add_handler(CommandHandler("togglelinks", togglelinks, block=False),
 # Universal scan handlers (group & DM) — group=1 so they run alongside commands
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)  # scans docs anywhere
 application.add_handler(MessageHandler(filters.PHOTO,         scan_photo,    block=False), group=1)  # scans photos anywhere
-# Filters reference: v20+ filters.Document.ALL, filters.PHOTO catch documents/photos respectively.  # docs
-#                                                                                                   # see references below
 
 # Group command tap (after commands)
 async def group_command_tap(update: Update, context):
