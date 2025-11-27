@@ -3,12 +3,11 @@
 """
 Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal scanner
 
-Highlights:
-- PTB v20 custom webhook (.updater(None)).
-- Global Defaults(block=False) so multiple handlers can run per update.  (PTB concurrency model)
+- PTB v20 custom webhook (.updater(None)) with Starlette.
+- Global Defaults(block=False) so multiple handlers can run per update.
 - Deletion is async + awaited everywhere.
 - Scan documents & photos in BOTH group and DM (filters.Document.ALL & filters.PHOTO).
-- New member alert (details posted to the group).
+- New member alert (details posted to the group) on NEW_CHAT_MEMBERS.
 - Robust startup: log PORT, run uvicorn with app object, never crash on set_webhook failures.
 """
 
@@ -30,9 +29,8 @@ from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.helpers import escape_markdown
-import telegram
+import telegram  # version logging
 
-# Starlette web server
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -226,7 +224,6 @@ async def enforce_admin_violation(update: Update, context, action_label: str = "
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
 
-    # Delete the command/action itself
     await delete_message_safe(update, context)
 
     total = add_warning(chat_id, user_id)
@@ -286,18 +283,50 @@ async def togglelinks(update: Update, context):
     BLOCK_LINKS = not BLOCK_LINKS
     await context.bot.send_message(update.effective_chat.id, f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
 
-# ----------------- Gate for unverified -----------------
-async def gate_unverified(update: Update, context):
-    chat = update.effective_chat
-    user = update.effective_user
-    msg = update.effective_message
-    is_start_cmd = bool(msg and msg.text and msg.text.strip().startswith("/start"))
-    if chat.type in ("group", "supergroup") and (chat.id, user.id) in UNVERIFIED and not is_start_cmd:
-        await delete_message_safe(update, context)
-        try:
-            await context.bot.send_message(chat.id, f"⛔ @{user.username or user.first_name}, please complete the CAPTCHA above to start chatting.")
-        except Exception:
-            pass
+# ----------------- Verification & Alerts -----------------
+async def welcome_verify(update: Update, context):
+    """Send join alert + start CAPTCHA gate."""
+    chat_id = update.effective_chat.id
+    for new_member in update.message.new_chat_members:
+        # Gate: mark unverified & restrict until solved
+        UNVERIFIED.add((chat_id, new_member.id))
+        await restrict_user(chat_id, new_member.id, context, until_date=None)
+
+        # CAPTCHA inline keyboard
+        correct = random.randint(1, 4)
+        options = list(range(1, 5))
+        random.shuffle(options)
+        keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify:{new_member.id}:{int(n==correct)}")] for n in options]
+        PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct}
+
+        # Alert with details in the group
+        uid = new_member.id
+        is_bot = "true" if new_member.is_bot else "false"
+        first_name = new_member.first_name or "-"
+        last_name = new_member.last_name or "-"
+        uname = new_member.username or "-"
+        ulink = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
+        lang = getattr(new_member, "language_code", None) or "-"
+
+        alert_text = (
+            "📣 NEW MEMBER ALERT\n"
+            f"• UID: {uid}\n"
+            f"• is_bot: {is_bot}\n"
+            f"• first_name: {first_name}\n"
+            f"• last_name: {last_name}\n"
+            f"• username: {uname} {ulink}\n"
+            f"• language_code: {lang}\n\n"
+            f"Please verify: pick **{correct}** to unlock chatting.\n"
+            f"UID: `{new_member.id}`"
+        )
+        await context.bot.send_message(chat_id, alert_text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def handle_join_request(update: Update, context):
+    req = update.chat_join_request
+    chat_id = req.chat.id
+    user_id = req.from_user.id
+    UNVERIFIED.add((chat_id, user_id))
+    logger.info(f"JOIN REQUEST: marked UNVERIFIED {(chat_id, user_id)}")
 
 # ----------------- Moderation -----------------
 async def moderate(update: Update, context):
@@ -483,7 +512,7 @@ logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
 builder = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
-    .updater(None)                   # custom webhook pattern; PTB example uses updater(None)
+    .updater(None)                   # custom webhook (PTB example)
     .defaults(Defaults(block=False)) # allow multiple handlers per update
 )
 try:
@@ -520,11 +549,11 @@ application.add_handler(CommandHandler("addbadword", addbadword, block=False), g
 application.add_handler(CommandHandler("removebadword", removebadword, block=False), group=1)
 application.add_handler(CommandHandler("togglelinks", togglelinks, block=False), group=1)
 
-# NEW: Universal scan handlers (group & DM) — group=1 so they run alongside commands
+# Universal scan handlers (group & DM) — group=1 so they run alongside commands
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)  # scans docs anywhere
 application.add_handler(MessageHandler(filters.PHOTO,         scan_photo,    block=False), group=1)  # scans photos anywhere
-# (filters.Document.ALL and filters.PHOTO are the correct PTB v20 filters for documents/photos)  # docs: filters module
-#                                                                                                  # see references below
+# Filters reference: v20+ filters.Document.ALL, filters.PHOTO catch documents/photos respectively.  # docs
+#                                                                                                   # see references below
 
 # Group command tap (after commands)
 async def group_command_tap(update: Update, context):
@@ -605,7 +634,6 @@ app = Starlette(routes=routes)
 async def on_startup():
     logger.info(f"Application starting … WEBHOOK_URL={WEBHOOK_URL!r} secret_valid={secret_is_valid(WEBHOOK_SECRET)}")
 
-    # Resolve exact bot username for addressing in groups
     try:
         me = await application.bot.get_me()
         global BOT_USERNAME
@@ -617,7 +645,6 @@ async def on_startup():
     await application.initialize()
     await application.start()
 
-    # Register webhook (avoid crashing if it fails)
     allowed = Update.ALL_TYPES
     try:
         if WEBHOOK_URL:
