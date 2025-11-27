@@ -15,8 +15,14 @@ import re
 import random
 import logging
 import asyncio
-import requests
 from datetime import datetime, timedelta
+
+# --- Optional dependency guard (so the app boots even if requests isn't installed yet)
+try:
+    import requests
+except ImportError:
+    requests = None
+
 from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
@@ -117,7 +123,7 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     return len(USER_MSG_TIMES[key])
 
 def secret_is_valid(token: str) -> bool:
-    # Telegram Bot API secret_token: only A-Z a-z 0-9 _ - (1..256)  (Bot API docs)
+    # Telegram Bot API secret_token rules (A-Z a-z 0-9 _ - ; 1..256)
     return bool(re.match(r'^[A-Za-z0-9_\-]{1,256}$', token))
 
 # ----------------- Diagnostics: log every update type -----------------
@@ -360,6 +366,13 @@ async def handle_join_request(update: Update, context):
 
 # ----------------- VirusTotal scanning -----------------
 async def vt_scan_and_report(file_path: str, progress_msg):
+    # Guard: if 'requests' isn’t installed, don’t crash the app
+    if requests is None:
+        await progress_msg.edit_text(
+            "❌ The 'requests' library is not installed. Add it to requirements.txt and redeploy."
+        )
+        return
+
     if not VT_API_KEY:
         await progress_msg.edit_text("❌ VirusTotal API key is not configured (VT_API_KEY).")
         return
@@ -501,7 +514,7 @@ try:
     )
     builder = ApplicationBuilder().token(BOT_TOKEN)
     try:
-        builder = builder.rate_limiter(AIORateLimiter())
+        builder = builder.rate_limiter(AIORateLimiter())  # optional extra, installed via requirements
     except Exception as e:
         logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
     application = builder.build()
@@ -667,3 +680,4 @@ async def on_shutdown():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("bot:app", host="0.0.0.0", port=port, workers=1)
