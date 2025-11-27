@@ -9,9 +9,7 @@ try:
 except ImportError:
     requests = None
 
-from telegram import (
-    Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
-)
+from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 from telegram.helpers import escape_markdown
 import telegram
 
@@ -32,6 +30,9 @@ BASE_URL        = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH    = "/webhook"
 WEBHOOK_URL     = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
 VT_API_KEY      = os.getenv("VT_API_KEY", "")
+
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is missing.")
 
 # VirusTotal API
 VT_FILE_SCAN_URL     = "https://www.virustotal.com/api/v3/files"
@@ -187,7 +188,6 @@ async def cmd_function(update: Update, context):
 
 # ---------------- Admin policy controls ----------------
 async def enforce_admin_violation(update: Update, context, action_label: str):
-    """Delete the offending command, warn user; mute only after WARN_LIMIT."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     await delete_message_safe(update, context)
@@ -196,7 +196,8 @@ async def enforce_admin_violation(update: Update, context, action_label: str):
         await context.bot.send_message(chat_id, f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s.")
         await restrict_user(chat_id, user_id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
     else:
-        await context.bot.send_message(chat_id,
+        await context.bot.send_message(
+            chat_id,
             f"⚠️ You are not allowed to {action_label}. Warning ({total}/{WARN_LIMIT}).\n"
             f"Further violations may result in a temporary mute."
         )
@@ -234,7 +235,7 @@ async def togglelinks(update: Update, context):
     BLOCK_LINKS = not BLOCK_LINKS
     await context.bot.send_message(update.effective_chat.id, f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
 
-# ---------------- Gate (must exist BEFORE registration!) ----------------
+# ---------------- Gate ----------------
 async def gate_unverified(update: Update, context):
     chat = update.effective_chat
     user = update.effective_user
@@ -255,14 +256,12 @@ async def moderate(update: Update, context):
     text    = (msg.text or msg.caption or "")
     if is_admin(user.id): return
 
-    # Flood
     if record_user_message(chat_id, user.id) > FLOOD_MAX_MSG:
         await delete_message_safe(update, context)
         await context.bot.send_message(chat_id, f"⌛ Slow down, @{user.username or user.first_name} (muted {MUTE_SECONDS}s).")
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
         return
 
-    # Bad words
     if any(bad in text.lower() for bad in BAD_WORDS):
         await delete_message_safe(update, context)
         total = add_warning(chat_id, user.id)
@@ -273,7 +272,6 @@ async def moderate(update: Update, context):
             await context.bot.send_message(chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.")
         return
 
-    # Links
     if BLOCK_LINKS and contains_link(text):
         await delete_message_safe(update, context)
         await context.bot.send_message(chat_id, "🔗 Links are not allowed here. If it’s class-related, ask an admin.")
@@ -418,9 +416,6 @@ async def verify_callback(update: Update, context):
         logger.debug(f"verify_callback error: {e}")
 
 # ---------------- PTB + Starlette ----------------
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is missing. Set it in environment.")
-
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
     ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter, Defaults
@@ -452,15 +447,12 @@ async def on_error(update: object, context):
     logger.error("Handler error", exc_info=context.error)
 application.add_error_handler(on_error)
 
-# ---- Handler registrations (AFTER all functions above!) ----
-# Diagnostics
+# ---- Handler registrations (AFTER functions) ----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
 
-# Gate first (non-blocking)
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
 
-# Commands (group=1)
 application.add_handler(CommandHandler("start",     cmd_start,     block=False), group=1)
 application.add_handler(CommandHandler("rules",     cmd_rules,     block=False), group=1)
 application.add_handler(CommandHandler("report",    cmd_report,    block=False), group=1)
@@ -471,21 +463,17 @@ application.add_handler(CommandHandler("addbadword",    addbadword,    block=Fal
 application.add_handler(CommandHandler("removebadword", removebadword, block=False), group=1)
 application.add_handler(CommandHandler("togglelinks",   togglelinks,   block=False), group=1)
 
-# File scanners (group & DM)
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)
 application.add_handler(MessageHandler(filters.PHOTO,         scan_photo,    block=False), group=1)
 
-# Join alerts + CAPTCHA
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify), group=1)
 application.add_handler(ChatJoinRequestHandler(handle_join_request), group=1)
 
-# Verify button
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"), group=1)
 
-# Moderation
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate), group=1)
 
-# Command tap log (optional)
+# ---- Command tap (optional log) ----
 async def group_command_tap(update: Update, context):
     msg = update.message; txt = msg.text or ""; ents = msg.entities or []; target = None
     for e in ents:
@@ -497,7 +485,6 @@ async def group_command_tap(update: Update, context):
         logger.info(f"GROUP COMMAND SEEN: text={txt!r}, target={target!r}, chat_id={update.effective_chat.id}, bot_status={cm.status}")
     except Exception as e:
         logger.debug(f"get_chat_member failed: {e}")
-
 application.add_handler(MessageHandler(filters.COMMAND & group_chats_filter_v20, group_command_tap), group=2)
 
 # ---- Commands menu ----
@@ -520,6 +507,7 @@ async def healthz(request: Request): return JSONResponse({"status":"ok"})
 async def root(request: Request):   return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request) -> Response:
+    # Optional secret header check
     if secret_is_valid(WEBHOOK_SECRET):
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
             logger.warning("Forbidden: secret mismatch"); return PlainTextResponse("forbidden", status_code=403)
@@ -533,28 +521,29 @@ routes = [ Route("/", root, methods=["GET"]),
            Route(WEBHOOK_PATH, webhook, methods=["POST"]) ]
 app = Starlette(routes=routes)
 
-# ---- Startup/Shutdown ----
-@app.on_event("startup")
-async def on_startup():
-    logger.info(f"Application starting … WEBHOOK_URL={WEBHOOK_URL!r} secret_valid={secret_is_valid(WEBHOOK_SECRET)}")
-    try:
-        me = await application.bot.get_me()
-        global BOT_USERNAME; BOT_USERNAME = me.username
-        logger.info(f"Bot identity: id={me.id}, username=@{BOT_USERNAME}")
-    except Exception as e:
-        logger.warning(f"get_me failed: {e}")
+# ---- Async main: start PTB + Uvicorn and SERVE (blocks) ----
+async def main():
+    import uvicorn
+    port = int(os.getenv("PORT", "10000"))
+    logger.info(f"Starting Uvicorn on 0.0.0.0:{port}")
+    config = uvicorn.Config(app=app, host="0.0.0.0", port=port, workers=1, log_level="info")
+    server = uvicorn.Server(config)
 
     await application.initialize()
     await application.start()
 
-    allowed = Update.ALL_TYPES
+    # set webhook (non-fatal on error)
     try:
         if WEBHOOK_URL:
             if secret_is_valid(WEBHOOK_SECRET):
-                await bot_for_update.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET,
-                                                 allowed_updates=allowed, drop_pending_updates=True)
+                await application.bot.set_webhook(
+                    url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET,
+                    allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
+                )
             else:
-                await bot_for_update.set_webhook(url=WEBHOOK_URL, allowed_updates=allowed, drop_pending_updates=True)
+                await application.bot.set_webhook(
+                    url=WEBHOOK_URL, allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
+                )
             logger.info(f"Webhook set to {WEBHOOK_URL}")
         else:
             logger.warning("WEBHOOK_URL empty; skipping set_webhook.")
@@ -562,17 +551,13 @@ async def on_startup():
         logger.error(f"set_webhook failed: {e}")
 
     await set_my_commands()
-    logger.info("Application started.")
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    logger.info("Application stopping …")
-    try: await application.stop()
-    except Exception as e: logger.warning(f"Error stopping app: {e}")
-    logger.info("Application stopped.")
+    # BLOCK here; prevents “Application exited early”
+    await server.serve()
 
-# ---- Entrypoint ----
+    # graceful stop
+    await application.stop()
+    await application.shutdown()
+
 if __name__ == "__main__":
-    import uvicorn
-    port = int(os.getenv("PORT", "10000"))
-    logger.info(f"Starting Uvicorn on 0.0.0.0:{port}")
+    asyncio.run(main())
