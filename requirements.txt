@@ -1,3 +1,4 @@
+# Prefer PTB v20+. If Render ever resolves an older v13, the code falls back automatically.
 python-telegram-bot[rate-limiter]==20.7
 starlette==0.38.2
 uvicorn[standard]==0.30.1
