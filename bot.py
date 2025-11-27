@@ -1,25 +1,28 @@
 
 #!/usr/bin/env python
-# bot.py — Safeguard Telegram Bot (Render-ready, webhook + healthz)
+# Safeguard Telegram Bot (Render-ready, webhook + healthz) + VirusTotal scanner
 #
 # Features:
 # - Content moderation (banned words, link blocking)
 # - Flood control (rate-limit users; temporary mute)
-# - New-member CAPTCHA verification
-# - New-member alert (id/is_bot/names/username link/language_code)
+# - New-member CAPTCHA verification + detailed new-member alert
 # - Admin policy controls (/addbadword, /removebadword, /togglelinks)
 # - User commands (/start, /rules, /report, /warnings, /function)
+# - VirusTotal v3 scanning for documents & photos (auto on upload)
 # - Render-compatible webhook server (Starlette) with /webhook & /healthz
 #
 # NOTES:
 # - The bot must be ADMIN in the group with "Restrict Members" rights for muting/restricting.
 # - WEBHOOK_SECRET must only use: A–Z a–z 0–9 underscore (_) and hyphen (-).
 # - Render injects PORT & RENDER_EXTERNAL_URL automatically.
+# - VirusTotal API requires an API key (VT_API_KEY) and has usage limits; see docs. [3](https://docs.virustotal.com/docs/api-overview)
 
 import os
 import re
 import random
 import logging
+import asyncio
+import requests
 from datetime import datetime, timedelta
 
 from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup
@@ -27,6 +30,7 @@ from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, ChatMemberHandler, filters, AIORateLimiter
 )
+from telegram.helpers import escape_markdown
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -47,10 +51,16 @@ logger = logging.getLogger("safeguard-bot")
 # ----------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "b77604a21c955932fcb178599437aa58")  # must be A-Z a-z 0-9 _ -
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # must be A-Z a-z 0-9 _ -
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render sets this automatically
 WEBHOOK_PATH = "/webhook"                                    # endpoint path on our server
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""  # full HTTPS URL for Telegram
+
+# VirusTotal API (v3)
+VT_API_KEY = os.getenv("VT_API_KEY", "")
+VT_FILE_SCAN_URL = "https://www.virustotal.com/api/v3/files"
+VT_ANALYSES_URL_TPL = "https://www.virustotal.com/api/v3/analyses/{}"
+VT_HEADERS = {"x-apikey": VT_API_KEY}  # v3 uses x-apikey header for authentication [2](https://github.com/Shuffle/openapi-apps/blob/master/docs/virustotal_v3.md)
 
 # Safeguard policies (customize as needed)
 BAD_WORDS = {"idiot", "stupid", "fool"}   # example list; add your own
@@ -64,6 +74,12 @@ MUTE_SECONDS = 60  # temporary mute duration
 PENDING_CAPTCHA = {}           # user_id -> {"chat_id": ..., "answer": ...}
 USER_WARNINGS = {}             # (chat_id, user_id) -> count
 USER_MSG_TIMES = {}            # (chat_id, user_id) -> [timestamps]
+
+# Progress banner for VT (rotates engines while waiting)
+ENGINES_FOR_PROGRESS = [
+    "Kaspersky", "Avast", "BitDefender", "ESET-NOD32", "Microsoft", "Sophos", "TrendMicro",
+    "McAfee", "DrWeb", "Fortinet", "ClamAV", "Paloalto", "Malwarebytes", "VIPRE"
+]
 
 # ----------------------------
 # Helpers
@@ -122,7 +138,8 @@ def secret_is_valid(token: str) -> bool:
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello! I keep this group safe—moderation, anti-spam, and new member verification.\n"
-        "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins."
+        "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins.\n\n"
+        "You can also send a file or photo and I’ll **scan it with VirusTotal** to check for malware."
     )
 
 async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -166,11 +183,15 @@ async def cmd_function(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Flood control: mute users who send too many messages too fast\n"
         "• Delete violating messages\n\n"
         "**Verification (Group)**\n"
-        "• New members must pass a simple CAPTCHA to chat\n\n"
+        "• New members must pass a simple CAPTCHA to chat\n"
+        "• Instant alert with user details when someone joins\n\n"
         "**Admin Controls**\n"
         "• /addbadword <word ...> – Add banned words\n"
         "• /removebadword <word ...> – Remove banned words\n"
         "• /togglelinks – Enable/disable link blocking\n\n"
+        "**Security Scanner**\n"
+        "• Send a **file** or **photo** to automatically scan with **VirusTotal** and get a readable summary.\n"
+        "  (Public API has rate limits; use wisely.)\n\n"
         "**Notes**\n"
         "• For muting/restricting, the bot must be **admin** with 'Restrict Members' right.\n"
         "• In groups with Privacy Mode ON, only commands are processed unless mentioned."
@@ -286,7 +307,7 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uname = new_member.username or "-"
         ulink = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
         lang = getattr(new_member, "language_code", None) or "-"
-        lang_link = "(-)"  # keep same placeholder style
+        lang_link = "(-)"  # placeholder
 
         alert_text = (
             f"id: {uid}\n"
@@ -300,12 +321,126 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 5) Post the alert to the group
         await context.bot.send_message(chat_id, alert_text)
 
-        # 6) (Optional) Notify admins privately as well
+        # 6) Optional: Notify admins
         for admin_id in ADMIN_IDS:
             try:
                 await context.bot.send_message(admin_id, f"[NEW MEMBER]\n{alert_text}")
             except Exception:
                 pass
+
+# ----------------------------
+# VirusTotal scanning (documents & photos)
+# ----------------------------
+async def vt_scan_and_report(file_path: str, progress_msg):
+    """Submit file to VT v3, poll analysis, and format a readable summary."""
+    if not VT_API_KEY:
+        await progress_msg.edit_text("❌ VirusTotal API key is not configured (VT_API_KEY).")
+        return
+
+    # 1) Upload file
+    try:
+        with open(file_path, "rb") as f:
+            resp = requests.post(VT_FILE_SCAN_URL, headers=VT_HEADERS, files={"file": f})
+            resp.raise_for_status()
+            analysis_id = resp.json().get("data", {}).get("id")
+        if not analysis_id:
+            await progress_msg.edit_text("❌ Failed to get analysis ID from VirusTotal.")
+            return
+        await progress_msg.edit_text("✅ File uploaded! Scanning in progress...")
+    except Exception as e:
+        await progress_msg.edit_text(
+            f"❌ Error uploading file: {escape_markdown(str(e), version=2)}",
+            parse_mode="MarkdownV2"
+        )
+        return
+
+    # 2) Poll analysis status
+    engine_index = 0
+    previous_text = None
+    attempts = 0
+    max_attempts = 120  # ~10 minutes
+
+    while attempts < max_attempts:
+        await asyncio.sleep(5)
+        try:
+            status_resp = requests.get(VT_ANALYSES_URL_TPL.format(analysis_id), headers=VT_HEADERS)
+            status_resp.raise_for_status()
+            attrs = status_resp.json().get("data", {}).get("attributes", {})
+            if attrs.get("status") == "completed":
+                stats = attrs.get("stats", {})
+                results = attrs.get("results", {})
+
+                malicious, suspicious, clean = [], [], []
+                for engine, det in results.items():
+                    category = det.get("category")
+                    result_text = det.get("result")
+                    if category == "malicious":
+                        malicious.append(f"• {engine}: {result_text}")
+                    elif category == "suspicious":
+                        suspicious.append(f"• {engine}: {result_text or 'Suspicious'}")
+                    else:
+                        clean.append(f"• {engine}: clean")
+
+                grouped = "──────────────\n"
+                if malicious:
+                    grouped += "🔴 *Malicious:*\n" + "\n".join(malicious) + "\n\n"
+                if suspicious:
+                    grouped += "🟠 *Suspicious:*\n" + "\n".join(suspicious) + "\n\n"
+                if clean:
+                    grouped += "✅ *Clean:*\n" + "\n".join(clean) + "\n"
+                grouped += "──────────────"
+
+                summary = (
+                    f"✅ **Scan Complete!**\n\n"
+                    f"🔎 **Summary:**\n"
+                    f"• 🛑 *Malicious:* `{stats.get('malicious', 0)}`\n"
+                    f"• ⚠️ *Suspicious:* `{stats.get('suspicious', 0)}`\n"
+                    f"• ✅ *Harmless:* `{stats.get('harmless', 0)}`\n"
+                    f"• ❓ *Undetected:* `{stats.get('undetected', 0)}`\n\n"
+                    f"🧠 **Detected details:**\n{grouped}\n\n"
+                    f"Powered by VirusTotal API v3"
+                )
+                await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
+                try:
+                    os.remove(file_path)
+                except Exception as e:
+                    logger.error(f"Error deleting file: {e}")
+                return
+
+            # Update progress banner (rotate engines)
+            new_banner = f"🔎 Scanning... please wait ({ENGINES_FOR_PROGRESS[engine_index]})"
+            if new_banner != previous_text:
+                await progress_msg.edit_text(new_banner)
+                previous_text = new_banner
+            engine_index = (engine_index + 1) % len(ENGINES_FOR_PROGRESS)
+            attempts += 1
+
+        except Exception as e:
+            logger.error(f"Error fetching VT report: {e}")
+            attempts += 1
+
+    # Timeout
+    await progress_msg.edit_text("⚠️ Scan taking too long. Please check manually on VirusTotal.")
+    try:
+        os.remove(file_path)
+    except Exception as e:
+        logger.error(f"Error deleting file after timeout: {e}")
+
+async def scan_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trigger scanning when a user uploads a file (document)."""
+    doc = update.message.document
+    file = await doc.get_file()
+    file_path = await file.download_to_drive()
+    progress_msg = await update.message.reply_text("⏳ Uploading file to VirusTotal and starting scan...")
+    await vt_scan_and_report(file_path, progress_msg)
+
+async def scan_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Trigger scanning when a user uploads a photo."""
+    photo = update.message.photo[-1]
+    file = await photo.get_file()
+    file_path = await file.download_to_drive()
+    progress_msg = await update.message.reply_text("⏳ Uploading image to VirusTotal and starting scan...")
+    await vt_scan_and_report(file_path, progress_msg)
 
 # ----------------------------
 # Verify button callback
@@ -358,8 +493,11 @@ application.add_handler(CommandHandler("addbadword", addbadword))
 application.add_handler(CommandHandler("removebadword", removebadword))
 application.add_handler(CommandHandler("togglelinks", togglelinks))
 
+# Moderation, join alerts, VT scanners
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate))
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))
+application.add_handler(MessageHandler(filters.Document.ALL, scan_document))
+application.add_handler(MessageHandler(filters.PHOTO, scan_photo))
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
 application.add_handler(ChatMemberHandler(lambda *_: None))  # optional
 
@@ -416,7 +554,7 @@ async def on_startup():
     await application.initialize()
     await application.start()
 
-    # Register webhook with secret if valid; otherwise without (to avoid Telegram BadRequest)
+    # Register webhook with secret if valid; otherwise without (to avoid Telegram BadRequest on invalid secrets)
     try:
         if WEBHOOK_URL:
             if secret_is_valid(WEBHOOK_SECRET):
@@ -428,7 +566,6 @@ async def on_startup():
                 logger.info(f"Webhook set to {WEBHOOK_URL} (no secret).")
     except Exception as e:
         logger.error(f"set_webhook failed: {e}")
-        # Exit early so Render restarts the service and logs the error clearly
         raise
 
     await set_my_commands()
