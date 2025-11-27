@@ -3,24 +3,12 @@
 """
 Safeguard Telegram Bot (Render-ready) + VirusTotal scanner
 
-Revision (2025-11-27):
-- Permanent CAPTCHA gate: new members are restricted until they verify (no timed auto-unmute).
-- Gate handler blocks ALL messages/commands from unverified users in GROUP/SUPERGROUP chats.
-- Admin-only enforcement for /addbadword, /removebadword, /togglelinks (delete + warn + temp-mute).
-- New-member alert prints UID clearly.
-- Group-only VT scan handlers (optional; remove chat-type filter if you want DM scans too).
-- Starlette webhook + /healthz compatible with Render, with optional WEBHOOK_SECRET verification.
-
-Environment variables to set in Render:
-  BOT_TOKEN         : Telegram bot token from @BotFather
-  ADMIN_IDS         : Comma-separated numeric Telegram user IDs (e.g. "12345,67890")
-  WEBHOOK_SECRET    : Optional secret for Telegram webhook header; A-Z a-z 0-9 _ -
-  RENDER_EXTERNAL_URL: Render injects this automatically for the public URL (https://...)
-  VT_API_KEY        : Optional VirusTotal API key (v3); leave empty to disable scans
-
-NOTE:
-- Make the bot ADMIN in the group with "Restrict Members" + "Delete Messages".
-- Disable Group Privacy in @BotFather: /setprivacy -> Disable, then remove & re-add the bot to the group.
+Key fixes in this revision:
+- Force webhook `allowed_updates` to include: message, chat_member, my_chat_member,
+  chat_join_request, callback_query; set `drop_pending_updates=True`.
+- Add diagnostic logging for every incoming update type.
+- Let `/start` respond even if the user is unverified (but still block everything else
+  until they pass CAPTCHA).
 """
 
 import os
@@ -83,7 +71,7 @@ USER_WARNINGS = {}    # (chat_id, user_id) -> count
 USER_MSG_TIMES = {}   # (chat_id, user_id) -> [timestamps]
 UNVERIFIED = set()    # set of (chat_id, user_id) currently under CAPTCHA gate
 
-# VT progress banner engines
+# VT engines (for progress banner)
 ENGINES_FOR_PROGRESS = [
     "Kaspersky", "Avast", "BitDefender", "ESET-NOD32", "Microsoft", "Sophos", "TrendMicro",
     "McAfee", "DrWeb", "Fortinet", "ClamAV", "Paloalto", "Malwarebytes", "VIPRE"
@@ -117,7 +105,7 @@ async def restrict_user(chat_id: int, user_id: int, context: ContextTypes.DEFAUL
     try:
         await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until_date)
     except Exception as e:
-        logger.warning(f"Restrict failed (bot likely not admin): {e}")
+        logger.warning(f"Restrict failed (bot likely not admin or missing rights): {e}")
 
 async def unrestrict_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE):
     perms = ChatPermissions(
@@ -147,33 +135,33 @@ def record_user_message(chat_id: int, user_id: int) -> int:
 def secret_is_valid(token: str) -> bool:
     return bool(re.match(r"^[A-Za-z0-9_\-]{1,256}$", token))
 
-async def enforce_admin_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, action_label: str = "change bot settings"):
-    user_id = update.effective_user.id
-    chat_id = update.effective_chat.id
-    msg = update.effective_message
-
-    await delete_message_safe(update, context)
-    total = add_warning(chat_id, user_id)
-
-    if total >= WARN_LIMIT:
-        try:
-            await msg.reply_text(f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s.")
-        except Exception:
-            pass
-        await restrict_user(chat_id, user_id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
-    else:
-        try:
-            await msg.reply_text(
-                f"⚠️ You are not allowed to {action_label}. Warning ({total}/{WARN_LIMIT}).\n"
-                f"Further violations may result in a temporary mute."
-            )
-        except Exception:
-            pass
+# ------------------------------
+# Diagnostics: log every update type
+# ------------------------------
+async def log_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Print the type(s) of this update to the logs for debugging
+    types = []
+    if update.message: types.append("message")
+    if update.edited_message: types.append("edited_message")
+    if update.channel_post: types.append("channel_post")
+    if update.edited_channel_post: types.append("edited_channel_post")
+    if update.inline_query: types.append("inline_query")
+    if update.chosen_inline_result: types.append("chosen_inline_result")
+    if update.callback_query: types.append("callback_query")
+    if update.shipping_query: types.append("shipping_query")
+    if update.pre_checkout_query: types.append("pre_checkout_query")
+    if update.poll: types.append("poll")
+    if update.poll_answer: types.append("poll_answer")
+    if update.my_chat_member: types.append("my_chat_member")
+    if update.chat_member: types.append("chat_member")
+    if update.chat_join_request: types.append("chat_join_request")
+    logger.info(f"UPDATE TYPES: {types}")
 
 # ------------------------------
 # Commands
 # ------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Always allow /start to reply (even if unverified) so users see a response.
     await update.message.reply_text(
         "Hello! I keep this group safe—moderation, anti-spam, and new member verification.\n"
         "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins.\n\n"
@@ -236,8 +224,31 @@ async def cmd_function(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="Markdown")
 
 # ------------------------------
-# Admin policy controls (updated)
+# Admin policy controls
 # ------------------------------
+async def enforce_admin_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, action_label: str = "change bot settings"):
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    msg = update.effective_message
+
+    await delete_message_safe(update, context)
+    total = add_warning(chat_id, user_id)
+
+    if total >= WARN_LIMIT:
+        try:
+            await msg.reply_text(f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s.")
+        except Exception:
+            pass
+        await restrict_user(chat_id, user_id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
+    else:
+        try:
+            await msg.reply_text(
+                f"⚠️ You are not allowed to {action_label}. Warning ({total}/{WARN_LIMIT}).\n"
+                f"Further violations may result in a temporary mute."
+            )
+        except Exception:
+            pass
+
 async def addbadword(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not is_admin(user_id):
@@ -283,12 +294,19 @@ async def togglelinks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
 
 # ------------------------------
-# Unverified gate: block all messages/commands in group until CAPTCHA passed
+# Gate: block all non-/start messages/commands from unverified users
 # ------------------------------
 async def gate_unverified(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
-    if chat.type in ("group", "supergroup") and (chat.id, user.id) in UNVERIFIED:
+    msg = update.effective_message
+    # Allow /start to help users see the bot; block everything else.
+    is_start_cmd = False
+    if msg and msg.text:
+        t = msg.text.strip()
+        is_start_cmd = t.startswith("/start")
+
+    if chat.type in ("group", "supergroup") and (chat.id, user.id) in UNVERIFIED and not is_start_cmd:
         await delete_message_safe(update, context)
         try:
             await context.bot.send_message(chat.id, f"⛔ @{user.username or user.first_name}, please complete the CAPTCHA above to start chatting.")
@@ -336,16 +354,16 @@ async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
 
 # ------------------------------
-# New member verification + alert (CAPTCHA + details with explicit UID)
+# New member verification + alert (CAPTCHA + UID)
 # ------------------------------
 async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     for new_member in update.message.new_chat_members:
-        # 1) Permanently restrict new member until verification
+        # Gate: restrict until verified
         UNVERIFIED.add((chat_id, new_member.id))
         await restrict_user(chat_id, new_member.id, context, until_date=None)
 
-        # 2) Verification challenge
+        # CAPTCHA
         correct = random.randint(1, 4)
         options = list(range(1, 5))
         random.shuffle(options)
@@ -354,7 +372,7 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct}
 
-        # 3) Prompt + UID
+        # Prompt + UID
         await context.bot.send_message(
             chat_id,
             (
@@ -366,7 +384,7 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-        # 4) Alert
+        # Alert
         uid = new_member.id
         is_bot = "true" if new_member.is_bot else "false"
         first_name = new_member.first_name or "-"
@@ -390,15 +408,16 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-# If your group uses "Approve new members": pre-gate on approval
+# Join requests (for groups with approval enabled)
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = update.chat_join_request
     chat_id = req.chat.id
     user_id = req.from_user.id
     UNVERIFIED.add((chat_id, user_id))
+    logger.info(f"JOIN REQUEST: marked UNVERIFIED {(chat_id, user_id)}")
 
 # ------------------------------
-# VirusTotal scanning (documents & photos)
+# VirusTotal scanning
 # ------------------------------
 async def vt_scan_and_report(file_path: str, progress_msg):
     if not VT_API_KEY:
@@ -539,13 +558,16 @@ application = (
     .build()
 )
 
+# Register diagnostic logger for all updates (high priority)
+application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
+
 # Register handlers
 group_chats = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
 
-# Gate unverified FIRST so it intercepts messages/commands
+# Gate first (blocks non-/start messages from unverified)
 application.add_handler(MessageHandler(group_chats & filters.ALL, gate_unverified), group=0)
 
-# Commands (blocked by gate_unverified for unverified users)
+# Commands
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("rules", cmd_rules))
 application.add_handler(CommandHandler("report", cmd_report))
@@ -588,7 +610,7 @@ async def root(request: Request):
     return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request):
-    # Verify secret token header from Telegram when set_webhook(..., secret_token=WEBHOOK_SECRET)
+    # Verify secret token header when set_webhook(..., secret_token=WEBHOOK_SECRET)
     if secret_is_valid(WEBHOOK_SECRET):
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
@@ -609,7 +631,9 @@ routes = [
 ]
 app = Starlette(routes=routes)
 
-# Startup/Shutdown: PTB lifecycle + webhook registration
+# ------------------------------
+# Startup/Shutdown (PTB lifecycle + webhook registration)
+# ------------------------------
 @app.on_event("startup")
 async def on_startup():
     logger.info("Application starting …")
@@ -617,13 +641,23 @@ async def on_startup():
     await application.start()
     try:
         if WEBHOOK_URL:
+            # Explicit allowed updates to ensure delivery of joins, requests, and messages
+            allowed = ["message", "chat_member", "my_chat_member", "chat_join_request", "callback_query"]
             if secret_is_valid(WEBHOOK_SECRET):
-                await application.bot.set_webhook(url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET)
-                logger.info(f"Webhook set to {WEBHOOK_URL} with secret.")
+                await application.bot.set_webhook(
+                    url=WEBHOOK_URL,
+                    secret_token=WEBHOOK_SECRET,
+                    allowed_updates=allowed,
+                    drop_pending_updates=True,
+                )
+                logger.info(f"Webhook set to {WEBHOOK_URL} with secret; allowed_updates={allowed}")
             else:
-                logger.warning("WEBHOOK_SECRET invalid; setting webhook without secret.")
-                await application.bot.set_webhook(url=WEBHOOK_URL)
-                logger.info(f"Webhook set to {WEBHOOK_URL} (no secret).")
+                await application.bot.set_webhook(
+                    url=WEBHOOK_URL,
+                    allowed_updates=allowed,
+                    drop_pending_updates=True,
+                )
+                logger.info(f"Webhook set to {WEBHOOK_URL} (no secret); allowed_updates={allowed}")
     except Exception as e:
         logger.error(f"set_webhook failed: {e}")
         raise
@@ -637,7 +671,7 @@ async def on_shutdown():
     logger.info("Application stopped.")
 
 # ------------------------------
-# Main (Render runs `python bot.py`)
+# Main (Render: python bot.py)
 # ------------------------------
 if __name__ == "__main__":
     import uvicorn
