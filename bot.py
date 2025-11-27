@@ -4,9 +4,10 @@
 Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal scanner
 
 Design:
-- python-telegram-bot v20 ApplicationBuilder with .updater(None) for a custom Starlette webhook
-- Startup does NOT raise on set_webhook failure (avoids "Application exited early" on Render)
-- Group diagnostics: error handler + logs in /start + a group command tap to inspect command routing
+- PTB v20 ApplicationBuilder with .updater(None) for a custom Starlette webhook (per PTB example).
+- Startup does NOT raise on set_webhook failure (avoids "Application exited early" on Render).
+- Group diagnostics: error handler + logs in /start, a group command tap that extracts the command target
+  and compares it with our actual @username; optional guidance if mismatched.
 
 Env vars:
   BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET (optional), VT_API_KEY (optional),
@@ -525,6 +526,7 @@ from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
     ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter
 )
+from telegram.constants import MessageEntityType
 
 # Version & URL diagnostics
 logger.info(f"Python: {sys.version}")
@@ -541,7 +543,7 @@ except Exception as e:
 application = builder.build()
 bot_for_update = application.bot
 
-# Log exact bot username on startup
+# Will be filled on startup with exact bot username
 BOT_USERNAME = None
 
 # Global error handler so we see permission problems in group replies
@@ -567,20 +569,49 @@ application.add_handler(CommandHandler("addbadword", addbadword))
 application.add_handler(CommandHandler("removebadword", removebadword))
 application.add_handler(CommandHandler("togglelinks", togglelinks))
 
-# --- Group command tap (logs raw command text & entities for troubleshooting) ---
+# --- Group command tap (extract target username, compare, and optionally guide) ---
 async def group_command_tap(update: Update, context):
     msg = update.message
     txt = msg.text or ""
-    ents = getattr(msg, "entities", None)
-    logger.info(f"GROUP COMMAND SEEN: text={txt!r}, entities={ents!r}, chat_id={update.effective_chat.id}")
+    ents = msg.entities or []
+    target = None
+    command_root = None
+    for e in ents:
+        if e.type == MessageEntityType.BOT_COMMAND:
+            cmd = txt[e.offset:e.offset + e.length]
+            command_root = cmd.split('@', 1)[0]  # '/start' or '/ping'
+            if '@' in cmd:
+                target = cmd.split('@', 1)[1]  # username after '@'
+            break
+
+    # Log command & target
+    try:
+        me = await context.bot.get_me()
+        cm = await context.bot.get_chat_member(update.effective_chat.id, me.id)
+        logger.info(
+            f"GROUP COMMAND SEEN: text={txt!r}, target={target!r}, our_username={BOT_USERNAME!r}, "
+            f"chat_id={update.effective_chat.id}, bot_status={cm.status}"
+        )
+    except Exception as e:
+        logger.debug(f"get_chat_member failed: {e}")
+
+    # If addressed to a different bot, help the user (optional hint)
+    if target and BOT_USERNAME and target.lower() != BOT_USERNAME.lower():
+        hint = f"ℹ️ This command is addressed to @{target}, not me (@{BOT_USERNAME}). " \
+               f"Use {command_root}@{BOT_USERNAME}."
+        try:
+            await msg.reply_text(hint)
+        except Exception as e:
+            logger.error(f"Guidance message failed in chat {update.effective_chat.id}: {e}")
+
 application.add_handler(MessageHandler(filters.COMMAND & group_chats_filter_v20, group_command_tap), group=1)
 
 # Moderation / join / scanners
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate))
-application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))
-application.add_handler(ChatJoinRequestHandler(handle_join_request))
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.Document.ALL, scan_document))
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.PHOTO, scan_photo))
+application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))
+application.add_handler(ChatJoinRequestHandler(handle_join_request))
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
 application.add_handler(ChatMemberHandler(lambda *_: None))
 
@@ -637,6 +668,7 @@ async def on_startup():
     # Resolve exact bot username for addressing in groups
     try:
         me = await application.bot.get_me()
+        global BOT_USERNAME
         BOT_USERNAME = me.username
         logger.info(f"Bot identity: id={me.id}, username=@{BOT_USERNAME}")
     except Exception as e:
