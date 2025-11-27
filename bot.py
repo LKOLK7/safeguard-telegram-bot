@@ -3,11 +3,12 @@
 """
 Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal scanner
 
-Fixes:
+Highlights in this version:
 - PTB v20 custom webhook (.updater(None)).
-- Global Defaults(block=False) + explicit block=False on CommandHandlers.
-- Command handlers placed in group=1 (after gate_unverified in group=0).
-- /start and /ping use context.bot.send_message (no reply-to) to avoid deletion edge cases.
+- Global Defaults(block=False) so multiple handlers can run per update.
+- FIXED deletion: delete_message_safe is async + all calls now `await` it.
+- Non-admin use of admin commands: offending message is DELETED + user gets a warning.
+- Bad words/links: offending message is DELETED + user gets a warning/mute escalation.
 """
 
 import os
@@ -18,6 +19,7 @@ import logging
 import asyncio
 from datetime import datetime, timedelta
 
+# Optional dependency guard for VirusTotal
 try:
     import requests
 except ImportError:
@@ -27,28 +29,33 @@ from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.helpers import escape_markdown
-import telegram
+import telegram  # version logging
 
+# Starlette web server
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
+# ----------------- Logging -----------------
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("safeguard-bot")
 
+# ----------------- Environment -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # allowed: A-Z a-z 0-9 _ -
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
 VT_API_KEY = os.getenv("VT_API_KEY", "")
 
+# VirusTotal (v3)
 VT_FILE_SCAN_URL = "https://www.virustotal.com/api/v3/files"
 VT_ANALYSES_URL_TPL = "https://www.virustotal.com/api/v3/analyses/{}"
 VT_HEADERS = {"x-apikey": VT_API_KEY}
 
+# Policies
 BAD_WORDS = {"idiot", "stupid", "fool"}
 BLOCK_LINKS = True
 WARN_LIMIT = 2
@@ -56,10 +63,11 @@ FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
 MUTE_SECONDS = 60
 
-PENDING_CAPTCHA = {}
-USER_WARNINGS = {}
-USER_MSG_TIMES = {}
-UNVERIFIED = set()
+# State
+PENDING_CAPTCHA = {}   # user_id -> {"chat_id": ..., "answer": ...}
+USER_WARNINGS = {}     # (chat_id, user_id) -> count
+USER_MSG_TIMES = {}    # (chat_id, user_id) -> [timestamps]
+UNVERIFIED = set()     # {(chat_id, user_id)} under CAPTCHA gate
 
 ENGINES_FOR_PROGRESS = [
     "Kaspersky", "Avast", "BitDefender", "ESET-NOD32", "Microsoft", "Sophos", "TrendMicro",
@@ -69,15 +77,18 @@ ENGINES_FOR_PROGRESS = [
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+# Links/mentions
 URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)", re.IGNORECASE)
 def contains_link(text: str) -> bool:
     return bool(URL_REGEX.search(text or ""))
 
-def delete_message_safe(update: Update, context):
+# >>> FIX: make deletion async and await everywhere <<<
+async def delete_message_safe(update: Update, context):
     try:
-        return context.bot.delete_message(update.effective_chat.id, update.effective_message.message_id)
+        await context.bot.delete_message(update.effective_chat.id, update.effective_message.message_id)
+        logger.info(f"Deleted offending message {update.effective_message.message_id} in chat {update.effective_chat.id}")
     except Exception as e:
-        logger.debug(f"Delete message failed: {e}")
+        logger.warning(f"Delete message failed in chat {update.effective_chat.id}: {e}")
 
 async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
     perms = ChatPermissions(
@@ -210,22 +221,30 @@ async def cmd_function(update: Update, context):
 
 # ----------------- Admin policy controls -----------------
 async def enforce_admin_violation(update: Update, context, action_label: str = "change bot settings"):
+    """Delete the offending command, warn the user, and optionally mute."""
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
-    msg = update.effective_message
-    delete_message_safe(update, context)
+
+    # Delete the command/action itself
+    await delete_message_safe(update, context)
+
     total = add_warning(chat_id, user_id)
     if total >= WARN_LIMIT:
         try:
-            await context.bot.send_message(chat_id, f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s.")
+            await context.bot.send_message(
+                chat_id,
+                f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s."
+            )
         except Exception:
             pass
         await restrict_user(chat_id, user_id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
     else:
         try:
-            await context.bot.send_message(chat_id,
+            await context.bot.send_message(
+                chat_id,
                 f"⚠️ You are not allowed to {action_label}. Warning ({total}/{WARN_LIMIT}).\n"
-                f"Further violations may result in a temporary mute.")
+                f"Further violations may result in a temporary mute."
+            )
         except Exception:
             pass
 
@@ -273,7 +292,7 @@ async def gate_unverified(update: Update, context):
     msg = update.effective_message
     is_start_cmd = bool(msg and msg.text and msg.text.strip().startswith("/start"))
     if chat.type in ("group", "supergroup") and (chat.id, user.id) in UNVERIFIED and not is_start_cmd:
-        delete_message_safe(update, context)
+        await delete_message_safe(update, context)
         try:
             await context.bot.send_message(chat.id, f"⛔ @{user.username or user.first_name}, please complete the CAPTCHA above to start chatting.")
         except Exception:
@@ -288,15 +307,17 @@ async def moderate(update: Update, context):
     if is_admin(user.id):
         return
 
+    # Flood control
     count = record_user_message(chat_id, user.id)
     if count > FLOOD_MAX_MSG:
-        delete_message_safe(update, context)
+        await delete_message_safe(update, context)
         await context.bot.send_message(chat_id, f"⌛ Slow down, @{user.username or user.first_name} (muted {MUTE_SECONDS}s).")
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
         return
 
+    # Bad words
     if any(bad in text.lower() for bad in BAD_WORDS):
-        delete_message_safe(update, context)
+        await delete_message_safe(update, context)
         total = add_warning(chat_id, user.id)
         if total >= WARN_LIMIT:
             await context.bot.send_message(chat_id, f"🚫 Keep it civil. Muted for {MUTE_SECONDS}s.")
@@ -305,8 +326,9 @@ async def moderate(update: Update, context):
             await context.bot.send_message(chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.")
         return
 
+    # Links
     if BLOCK_LINKS and contains_link(text):
-        delete_message_safe(update, context)
+        await delete_message_safe(update, context)
         await context.bot.send_message(chat_id, "🔗 Links are not allowed here. If it’s class-related, ask an admin.")
         total = add_warning(chat_id, user.id)
         if total >= WARN_LIMIT:
@@ -361,8 +383,11 @@ async def handle_join_request(update: Update, context):
 # ----------------- VirusTotal scanning -----------------
 async def vt_scan_and_report(file_path: str, progress_msg):
     if requests is None:
-        await progress_msg.edit_text("❌ The 'requests' library is not installed. Add it to requirements.txt and redeploy.")
+        await progress_msg.edit_text(
+            "❌ The 'requests' library is not installed. Add it to requirements.txt and redeploy."
+        )
         return
+
     if not VT_API_KEY:
         await progress_msg.edit_text("❌ VirusTotal API key is not configured (VT_API_KEY).")
         return
@@ -496,16 +521,18 @@ from telegram.ext import (
 )
 from telegram.constants import MessageEntityType
 
+# Version & URL diagnostics
 logger.info(f"Python: {sys.version}")
 logger.info(f"python-telegram-bot: {telegram.__version__}")
 logger.info(f"RENDER_EXTERNAL_URL: {os.getenv('RENDER_EXTERNAL_URL')}")
 logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
 
+# Non-blocking handlers globally + custom webhook
 builder = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
-    .updater(None)                   # custom webhook (PTB example)  ──► docs
-    .defaults(Defaults(block=False)) # non-blocking handlers globally
+    .updater(None)                   # custom webhook pattern
+    .defaults(Defaults(block=False)) # allow multiple handlers per update
 )
 try:
     builder = builder.rate_limiter(AIORateLimiter())
@@ -514,7 +541,6 @@ except Exception as e:
 
 application = builder.build()
 bot_for_update = application.bot
-
 BOT_USERNAME = None
 
 async def on_error(update: object, context):
@@ -542,17 +568,15 @@ application.add_handler(CommandHandler("addbadword", addbadword, block=False), g
 application.add_handler(CommandHandler("removebadword", removebadword, block=False), group=1)
 application.add_handler(CommandHandler("togglelinks", togglelinks, block=False), group=1)
 
-# Group command tap after commands (group=2)
+# Group command tap (after commands)
 async def group_command_tap(update: Update, context):
     msg = update.message
     txt = msg.text or ""
     ents = msg.entities or []
     target = None
-    command_root = None
     for e in ents:
         if e.type == MessageEntityType.BOT_COMMAND:
             cmd = txt[e.offset:e.offset + e.length]
-            command_root = cmd.split('@', 1)[0]
             if '@' in cmd:
                 target = cmd.split('@', 1)[1]
             break
@@ -575,6 +599,7 @@ application.add_handler(ChatJoinRequestHandler(handle_join_request))
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
 application.add_handler(ChatMemberHandler(lambda *_: None))
 
+# ----------------- Commands menu -----------------
 async def set_my_commands():
     try:
         cmds = [
@@ -597,6 +622,7 @@ async def root(request: Request):
     return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request) -> Response:
+    # Optional secret header check
     if secret_is_valid(WEBHOOK_SECRET):
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
@@ -606,6 +632,8 @@ async def webhook(request: Request) -> Response:
         data = await request.json()
     except Exception:
         return PlainTextResponse("bad request", status_code=400)
+
+    # Feed the update into PTB (custom webhook pattern)
     await application.update_queue.put(Update.de_json(data=data, bot=bot_for_update))
     return Response()
 
@@ -620,6 +648,8 @@ app = Starlette(routes=routes)
 @app.on_event("startup")
 async def on_startup():
     logger.info(f"Application starting … WEBHOOK_URL={WEBHOOK_URL!r} secret_valid={secret_is_valid(WEBHOOK_SECRET)}")
+
+    # Resolve exact bot username for addressing in groups
     try:
         me = await application.bot.get_me()
         global BOT_USERNAME
@@ -631,6 +661,7 @@ async def on_startup():
     await application.initialize()
     await application.start()
 
+    # Register webhook (avoid crashing if it fails)
     allowed = Update.ALL_TYPES
     try:
         if WEBHOOK_URL:
@@ -653,6 +684,7 @@ async def on_startup():
             logger.warning("WEBHOOK_URL is empty; skipping set_webhook.")
     except Exception as e:
         logger.error(f"set_webhook failed: {e}")
+        # Keep serving so health checks pass and you can fix webhook later
 
     await set_my_commands()
     logger.info("Application started.")
@@ -670,4 +702,3 @@ async def on_shutdown():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("bot:app", host="0.0.0.0", port=port, workers=1)
