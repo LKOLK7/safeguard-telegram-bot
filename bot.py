@@ -1,8 +1,16 @@
 
 #!/usr/bin/env python
 # Safeguard Telegram Bot (Render-ready, webhook + healthz) + VirusTotal scanner
+# 
+# Changes in this revision:
+# - Enforce admin-only policy for /addbadword, /removebadword, /togglelinks:
+#   Non-admins: delete their command message, add a warning, and mute when WARN_LIMIT reached.
+# - New member alert explicitly shows UID and basic details in the group + optional admin DM.
+# - Document/photo scanning limited to group chats only (optional; adjust as needed).
+# - Link detection regex simplified & hardened.
+# - Notes added about BotFather privacy mode (must be disabled to receive normal group messages).
 #
-# Features:
+# Features (unchanged):
 # - Content moderation (banned words, link blocking)
 # - Flood control (rate-limit users; temporary mute)
 # - New-member CAPTCHA verification + detailed new-member alert
@@ -13,9 +21,11 @@
 #
 # NOTES:
 # - The bot must be ADMIN in the group with "Restrict Members" rights for muting/restricting.
+# - To let the bot receive *normal group messages* (including file uploads), disable Group Privacy via @BotFather:
+#     /setprivacy -> Disable, then remove & re-add the bot to the group.
 # - WEBHOOK_SECRET must only use: A–Z a–z 0–9 underscore (_) and hyphen (-).
 # - Render injects PORT & RENDER_EXTERNAL_URL automatically.
-# - VirusTotal API requires an API key (VT_API_KEY) and has usage limits; see docs. [3](https://docs.virustotal.com/docs/api-overview)
+# - VirusTotal API requires an API key (VT_API_KEY) and has usage limits; see docs.
 
 import os
 import re
@@ -37,33 +47,33 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Route
 
-# ----------------------------
+# ------------------------------
 # Logging
-# ----------------------------
+# ------------------------------
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger("safeguard-bot")
 
-# ----------------------------
+# ------------------------------
 # Environment & Config
-# ----------------------------
+# ------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # must be A-Z a-z 0-9 _ -
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render sets this automatically
-WEBHOOK_PATH = "/webhook"                                    # endpoint path on our server
+WEBHOOK_PATH = "/webhook"  # endpoint path on our server
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""  # full HTTPS URL for Telegram
 
 # VirusTotal API (v3)
 VT_API_KEY = os.getenv("VT_API_KEY", "")
 VT_FILE_SCAN_URL = "https://www.virustotal.com/api/v3/files"
 VT_ANALYSES_URL_TPL = "https://www.virustotal.com/api/v3/analyses/{}"
-VT_HEADERS = {"x-apikey": VT_API_KEY}  # v3 uses x-apikey header for authentication [2](https://github.com/Shuffle/openapi-apps/blob/master/docs/virustotal_v3.md)
+VT_HEADERS = {"x-apikey": VT_API_KEY}  # v3 uses x-apikey header for authentication
 
 # Safeguard policies (customize as needed)
-BAD_WORDS = {"idiot", "stupid", "fool"}   # example list; add your own
+BAD_WORDS = {"idiot", "stupid", "fool"}  # example list; add your own
 BLOCK_LINKS = True
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
@@ -71,9 +81,9 @@ FLOOD_WINDOW_SEC = 10
 MUTE_SECONDS = 60  # temporary mute duration
 
 # In-memory state (replace with DB if you need persistence)
-PENDING_CAPTCHA = {}           # user_id -> {"chat_id": ..., "answer": ...}
-USER_WARNINGS = {}             # (chat_id, user_id) -> count
-USER_MSG_TIMES = {}            # (chat_id, user_id) -> [timestamps]
+PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ...}
+USER_WARNINGS = {}  # (chat_id, user_id) -> count
+USER_MSG_TIMES = {}  # (chat_id, user_id) -> [timestamps]
 
 # Progress banner for VT (rotates engines while waiting)
 ENGINES_FOR_PROGRESS = [
@@ -81,14 +91,17 @@ ENGINES_FOR_PROGRESS = [
     "McAfee", "DrWeb", "Fortinet", "ClamAV", "Paloalto", "Malwarebytes", "VIPRE"
 ]
 
-# ----------------------------
+# ------------------------------
 # Helpers
-# ----------------------------
+# ------------------------------
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
+# Hardened URL detection (t.me, telegram.me, generic URLs, @mentions)
+URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)", re.IGNORECASE)
+
 def contains_link(text: str) -> bool:
-    return bool(re.search(r"(https?://|t\.me/|telegram\.me|@[\w_]+)", text, re.IGNORECASE))
+    return bool(URL_REGEX.search(text))
 
 async def delete_message_safe(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -130,11 +143,37 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     return len(USER_MSG_TIMES[key])
 
 def secret_is_valid(token: str) -> bool:
-    return bool(re.match(r"^[A-Za-z0-9_-]{1,256}$", token))
+    return bool(re.match(r"^[A-Za-z0-9_\-]{1,256}$", token))
 
-# ----------------------------
+async def enforce_admin_violation(update: Update, context: ContextTypes.DEFAULT_TYPE, action_label: str = "change bot settings"):
+    """Common enforcement: delete message, warn, and optionally mute."""
+    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id
+    msg = update.effective_message
+
+    # Delete violating command
+    await delete_message_safe(update, context)
+
+    # Add warning & notify
+    total = add_warning(chat_id, user_id)
+    if total >= WARN_LIMIT:
+        try:
+            await msg.reply_text(f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s.")
+        except Exception:
+            pass
+        await mute_user(chat_id, user_id, context, seconds=MUTE_SECONDS)
+    else:
+        try:
+            await msg.reply_text(
+                f"⚠️ You are not allowed to {action_label}. Warning ({total}/{WARN_LIMIT}).\n"
+                f"Further violations may result in a temporary mute."
+            )
+        except Exception:
+            pass
+
+# ------------------------------
 # Commands
-# ----------------------------
+# ------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Hello! I keep this group safe—moderation, anti-spam, and new member verification.\n"
@@ -168,10 +207,10 @@ async def cmd_warnings(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
     await update.message.reply_text(f"Your current warnings: {count}")
 
-# --- /function: Show bot capabilities ----------------------------------------
+# --- /function: Show bot capabilities ---
 async def cmd_function(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "🔧 **Safeguard Bot Functions**\n\n"
+        "🛠 **Safeguard Bot Functions**\n\n"
         "**General (Private & Group)**\n"
         "• /start – Introduction and how to use the bot\n"
         "• /rules – Display the group rules\n"
@@ -184,57 +223,70 @@ async def cmd_function(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Delete violating messages\n\n"
         "**Verification (Group)**\n"
         "• New members must pass a simple CAPTCHA to chat\n"
-        "• Instant alert with user details when someone joins\n\n"
+        "• Instant alert with user details when someone joins (UID shown)\n\n"
         "**Admin Controls**\n"
-        "• /addbadword <word ...> – Add banned words\n"
-        "• /removebadword <word ...> – Remove banned words\n"
-        "• /togglelinks – Enable/disable link blocking\n\n"
+        "• /addbadword <word ...> – Add banned words (admins only)\n"
+        "• /removebadword <word ...> – Remove banned words (admins only)\n"
+        "• /togglelinks – Enable/disable link blocking (admins only)\n\n"
         "**Security Scanner**\n"
         "• Send a **file** or **photo** to automatically scan with **VirusTotal** and get a readable summary.\n"
         "  (Public API has rate limits; use wisely.)\n\n"
         "**Notes**\n"
         "• For muting/restricting, the bot must be **admin** with 'Restrict Members' right.\n"
-        "• In groups with Privacy Mode ON, only commands are processed unless mentioned."
+        "• Disable Group Privacy in BotFather so the bot can receive normal group messages."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
-# ----------------------------
-# Admin policy controls
-# ----------------------------
+# ------------------------------
+# Admin policy controls (updated)
+# ------------------------------
 async def addbadword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await enforce_admin_violation(update, context, action_label="change bot settings (/addbadword)")
         return
+
+    msg = update.effective_message
     if not context.args:
-        await update.message.reply_text("Usage: /addbadword <word>")
+        await msg.reply_text("Usage: /addbadword <word>")
         return
+
     for w in context.args:
         BAD_WORDS.add(w.lower())
-    await update.message.reply_text(f"Added: {', '.join(context.args)}")
+    await msg.reply_text(f"Added: {', '.join(context.args)}")
 
 async def removebadword(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await enforce_admin_violation(update, context, action_label="change bot settings (/removebadword)")
         return
+
+    msg = update.effective_message
     if not context.args:
-        await update.message.reply_text("Usage: /removebadword <word>")
+        await msg.reply_text("Usage: /removebadword <word>")
         return
+
     removed = []
     for w in context.args:
         wl = w.lower()
         if wl in BAD_WORDS:
             BAD_WORDS.remove(wl)
             removed.append(w)
-    await update.message.reply_text(f"Removed: {', '.join(removed) if removed else '(none)'}")
+    await msg.reply_text(f"Removed: {', '.join(removed) if removed else '(none)'}")
 
 async def togglelinks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        await enforce_admin_violation(update, context, action_label="change bot settings (/togglelinks)")
         return
+
     global BLOCK_LINKS
     BLOCK_LINKS = not BLOCK_LINKS
-    await update.message.reply_text(f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
+    await update.effective_message.reply_text(f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
 
-# ----------------------------
+# ------------------------------
 # Moderation handler
-# ----------------------------
+# ------------------------------
 async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     user = msg.from_user
@@ -271,9 +323,9 @@ async def moderate(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if total >= WARN_LIMIT:
             await mute_user(chat_id, user.id, context, seconds=MUTE_SECONDS)
 
-# ----------------------------
-# New member verification + alert (CAPTCHA + details)
-# ----------------------------
+# ------------------------------
+# New member verification + alert (CAPTCHA + details with explicit UID)
+# ------------------------------
 async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     for new_member in update.message.new_chat_members:
@@ -285,21 +337,23 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         options = list(range(1, 5))
         random.shuffle(options)
         keyboard = [
-            [InlineKeyboardButton(str(n), callback_data=f"verify:{new_member.id}:{int(n==correct)}")]
-            for n in options
+            [InlineKeyboardButton(str(n), callback_data=f"verify:{new_member.id}:{int(n==correct)}")] for n in options
         ]
         PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct}
 
-        # 3) Send the verification prompt
+        # 3) Send the verification prompt (print UID clearly)
         await context.bot.send_message(
             chat_id,
-            f"👋 Welcome, @{new_member.username or new_member.first_name}!\n"
-            f"Please verify: pick **{correct}** to unlock chatting.",
+            (
+                f"👋 Welcome, @{new_member.username or new_member.first_name}!\n"
+                f"Please verify: pick **{correct}** to unlock chatting.\n"
+                f"UID: `{new_member.id}`"
+            ),
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
         )
 
-        # 4) Compose the alert with user details (exact format requested)
+        # 4) Compose the alert with user details (explicit UID)
         uid = new_member.id
         is_bot = "true" if new_member.is_bot else "false"
         first_name = new_member.first_name or "-"
@@ -307,15 +361,14 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uname = new_member.username or "-"
         ulink = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
         lang = getattr(new_member, "language_code", None) or "-"
-        lang_link = "(-)"  # placeholder
-
         alert_text = (
-            f"id: {uid}\n"
-            f" ├ is_bot: {is_bot}\n"
-            f" ├ first_name: {first_name}\n"
-            f" ├ last_name: {last_name}\n"
-            f" ├ username: {uname} {ulink}\n"
-            f" └ language_code: {lang} {lang_link}"
+            "📣 NEW MEMBER ALERT\n"
+            f"• UID: {uid}\n"
+            f"• is_bot: {is_bot}\n"
+            f"• first_name: {first_name}\n"
+            f"• last_name: {last_name}\n"
+            f"• username: {uname} {ulink}\n"
+            f"• language_code: {lang}"
         )
 
         # 5) Post the alert to the group
@@ -328,9 +381,9 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-# ----------------------------
+# ------------------------------
 # VirusTotal scanning (documents & photos)
-# ----------------------------
+# ------------------------------
 async def vt_scan_and_report(file_path: str, progress_msg):
     """Submit file to VT v3, poll analysis, and format a readable summary."""
     if not VT_API_KEY:
@@ -341,8 +394,8 @@ async def vt_scan_and_report(file_path: str, progress_msg):
     try:
         with open(file_path, "rb") as f:
             resp = requests.post(VT_FILE_SCAN_URL, headers=VT_HEADERS, files={"file": f})
-            resp.raise_for_status()
-            analysis_id = resp.json().get("data", {}).get("id")
+        resp.raise_for_status()
+        analysis_id = resp.json().get("data", {}).get("id")
         if not analysis_id:
             await progress_msg.edit_text("❌ Failed to get analysis ID from VirusTotal.")
             return
@@ -359,7 +412,6 @@ async def vt_scan_and_report(file_path: str, progress_msg):
     previous_text = None
     attempts = 0
     max_attempts = 120  # ~10 minutes
-
     while attempts < max_attempts:
         await asyncio.sleep(5)
         try:
@@ -369,7 +421,6 @@ async def vt_scan_and_report(file_path: str, progress_msg):
             if attrs.get("status") == "completed":
                 stats = attrs.get("stats", {})
                 results = attrs.get("results", {})
-
                 malicious, suspicious, clean = [], [], []
                 for engine, det in results.items():
                     category = det.get("category")
@@ -380,7 +431,6 @@ async def vt_scan_and_report(file_path: str, progress_msg):
                         suspicious.append(f"• {engine}: {result_text or 'Suspicious'}")
                     else:
                         clean.append(f"• {engine}: clean")
-
                 grouped = "──────────────\n"
                 if malicious:
                     grouped += "🔴 *Malicious:*\n" + "\n".join(malicious) + "\n\n"
@@ -389,11 +439,10 @@ async def vt_scan_and_report(file_path: str, progress_msg):
                 if clean:
                     grouped += "✅ *Clean:*\n" + "\n".join(clean) + "\n"
                 grouped += "──────────────"
-
                 summary = (
                     f"✅ **Scan Complete!**\n\n"
                     f"🔎 **Summary:**\n"
-                    f"• 🛑 *Malicious:* `{stats.get('malicious', 0)}`\n"
+                    f"• 🛡 *Malicious:* `{stats.get('malicious', 0)}`\n"
                     f"• ⚠️ *Suspicious:* `{stats.get('suspicious', 0)}`\n"
                     f"• ✅ *Harmless:* `{stats.get('harmless', 0)}`\n"
                     f"• ❓ *Undetected:* `{stats.get('undetected', 0)}`\n\n"
@@ -414,7 +463,6 @@ async def vt_scan_and_report(file_path: str, progress_msg):
                 previous_text = new_banner
             engine_index = (engine_index + 1) % len(ENGINES_FOR_PROGRESS)
             attempts += 1
-
         except Exception as e:
             logger.error(f"Error fetching VT report: {e}")
             attempts += 1
@@ -427,7 +475,7 @@ async def vt_scan_and_report(file_path: str, progress_msg):
         logger.error(f"Error deleting file after timeout: {e}")
 
 async def scan_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Trigger scanning when a user uploads a file (document)."""
+    """Trigger scanning when a user uploads a file (document) in group chats."""
     doc = update.message.document
     file = await doc.get_file()
     file_path = await file.download_to_drive()
@@ -435,16 +483,16 @@ async def scan_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await vt_scan_and_report(file_path, progress_msg)
 
 async def scan_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Trigger scanning when a user uploads a photo."""
+    """Trigger scanning when a user uploads a photo in group chats."""
     photo = update.message.photo[-1]
     file = await photo.get_file()
     file_path = await file.download_to_drive()
     progress_msg = await update.message.reply_text("⏳ Uploading image to VirusTotal and starting scan...")
     await vt_scan_and_report(file_path, progress_msg)
 
-# ----------------------------
+# ------------------------------
 # Verify button callback
-# ----------------------------
+# ------------------------------
 async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -469,9 +517,9 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.debug(f"verify_callback error: {e}")
 
-# ----------------------------
+# ------------------------------
 # Build PTB Application (async + rate limiter)
-# ----------------------------
+# ------------------------------
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in environment.")
 
@@ -488,7 +536,6 @@ application.add_handler(CommandHandler("rules", cmd_rules))
 application.add_handler(CommandHandler("report", cmd_report))
 application.add_handler(CommandHandler("warnings", cmd_warnings))
 application.add_handler(CommandHandler("function", cmd_function))
-
 application.add_handler(CommandHandler("addbadword", addbadword))
 application.add_handler(CommandHandler("removebadword", removebadword))
 application.add_handler(CommandHandler("togglelinks", togglelinks))
@@ -496,8 +543,12 @@ application.add_handler(CommandHandler("togglelinks", togglelinks))
 # Moderation, join alerts, VT scanners
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate))
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))
-application.add_handler(MessageHandler(filters.Document.ALL, scan_document))
-application.add_handler(MessageHandler(filters.PHOTO, scan_photo))
+
+# Limit VT scanning to group chats only (optional). Remove `group_chats` if you want scans everywhere.
+group_chats = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+application.add_handler(MessageHandler(group_chats & filters.Document.ALL, scan_document))
+application.add_handler(MessageHandler(group_chats & filters.PHOTO, scan_photo))
+
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
 application.add_handler(ChatMemberHandler(lambda *_: None))  # optional
 
@@ -514,9 +565,9 @@ async def set_my_commands():
     except Exception as e:
         logger.debug(f"set_my_commands failed: {e}")
 
-# ----------------------------
+# ------------------------------
 # Starlette Web App (webhook + health check)
-# ----------------------------
+# ------------------------------
 async def healthz(request: Request):
     return JSONResponse({"status": "ok"})
 
@@ -530,12 +581,10 @@ async def webhook(request: Request):
         if hdr != WEBHOOK_SECRET:
             logger.warning("Forbidden webhook call: secret mismatch")
             return PlainTextResponse("forbidden", status_code=403)
-
     try:
         data = await request.json()
     except Exception:
         return PlainTextResponse("bad request", status_code=400)
-
     update = Update.de_json(data, application.bot)
     await application.process_update(update)
     return PlainTextResponse("ok")
@@ -553,7 +602,6 @@ async def on_startup():
     logger.info("Application starting …")
     await application.initialize()
     await application.start()
-
     # Register webhook with secret if valid; otherwise without (to avoid Telegram BadRequest on invalid secrets)
     try:
         if WEBHOOK_URL:
@@ -567,7 +615,6 @@ async def on_startup():
     except Exception as e:
         logger.error(f"set_webhook failed: {e}")
         raise
-
     await set_my_commands()
     logger.info("Application started.")
 
@@ -577,10 +624,10 @@ async def on_shutdown():
     await application.stop()
     logger.info("Application stopped.")
 
-# ----------------------------
+# ------------------------------
 # Main (Render: uses PORT env var)
-# ----------------------------
+# ------------------------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))  # Render sets PORT automatically
-    uvicorn.run("bot:app", host="0.0.0.0", port=port, workers=1)
+    uvicorn.run("safeguard_bot_with_virus_scanner:app", host="0.0.0.0", port=port, workers=1)
