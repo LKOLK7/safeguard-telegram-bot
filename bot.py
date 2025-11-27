@@ -1,14 +1,19 @@
 
 #!/usr/bin/env python
 """
-Safeguard Telegram Bot (Render-ready) + VirusTotal scanner
+Safeguard Telegram Bot (Render-ready, PTB v20) + VirusTotal scanner
 
 Key fixes in this revision:
-- Force webhook `allowed_updates` to include: message, chat_member, my_chat_member,
-  chat_join_request, callback_query; set `drop_pending_updates=True`.
-- Add diagnostic logging for every incoming update type.
-- Let `/start` respond even if the user is unverified (but still block everything else
-  until they pass CAPTCHA).
+- Force webhook `allowed_updates` (message, chat_member, my_chat_member, chat_join_request, callback_query)
+  and `drop_pending_updates=True` to ensure join events are delivered.
+- Permanent CAPTCHA gate: new members are restricted until they verify.
+- Gate handler blocks ALL posts from unverified users, but lets `/start` reply so users see the bot.
+- Admin-only enforcement: /addbadword, /removebadword, /togglelinks (delete + warn + temp-mute).
+- Diagnostic logging: logs every incoming update type.
+- Safe fallback: if AIORateLimiter optional extra is not installed, the bot still runs.
+
+Env vars (Render Dashboard):
+  BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET (optional), VT_API_KEY (optional), RENDER_EXTERNAL_URL (auto)
 """
 
 import os
@@ -23,7 +28,7 @@ from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboa
 from telegram.ext import (
     ApplicationBuilder, ContextTypes, CommandHandler, MessageHandler,
     CallbackQueryHandler, ChatMemberHandler, ChatJoinRequestHandler,
-    filters, AIORateLimiter
+    filters
 )
 from telegram.helpers import escape_markdown
 
@@ -139,7 +144,6 @@ def secret_is_valid(token: str) -> bool:
 # Diagnostics: log every update type
 # ------------------------------
 async def log_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Print the type(s) of this update to the logs for debugging
     types = []
     if update.message: types.append("message")
     if update.edited_message: types.append("edited_message")
@@ -161,7 +165,7 @@ async def log_all_updates(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Commands
 # ------------------------------
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Always allow /start to reply (even if unverified) so users see a response.
+    # Allow /start to reply even if the user is unverified; block everything else.
     await update.message.reply_text(
         "Hello! I keep this group safe—moderation, anti-spam, and new member verification.\n"
         "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins.\n\n"
@@ -294,13 +298,14 @@ async def togglelinks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
 
 # ------------------------------
-# Gate: block all non-/start messages/commands from unverified users
+# Gate: block all non-/start posts from unverified users
 # ------------------------------
 async def gate_unverified(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     msg = update.effective_message
-    # Allow /start to help users see the bot; block everything else.
+
+    # Allow /start so users see the bot; block everything else until verified.
     is_start_cmd = False
     if msg and msg.text:
         t = msg.text.strip()
@@ -546,25 +551,29 @@ async def verify_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.debug(f"verify_callback error: {e}")
 
 # ------------------------------
-# Build PTB Application (async + rate limiter)
+# Build PTB Application (async + rate limiter with safe fallback)
 # ------------------------------
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in environment.")
 
-application = (
-    ApplicationBuilder()
-    .token(BOT_TOKEN)
-    .rate_limiter(AIORateLimiter())
-    .build()
-)
+application_builder = ApplicationBuilder().token(BOT_TOKEN)
 
-# Register diagnostic logger for all updates (high priority)
+# Try to use AIORateLimiter (requires python-telegram-bot[rate-limiter]); fallback if not available
+try:
+    from telegram.ext import AIORateLimiter
+    application_builder = application_builder.rate_limiter(AIORateLimiter())
+except Exception as e:
+    logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
+
+application = application_builder.build()
+
+# Diagnostics logger for all updates (very high priority)
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
 
 # Register handlers
 group_chats = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
 
-# Gate first (blocks non-/start messages from unverified)
+# Gate first (blocks non-/start posts from unverified users)
 application.add_handler(MessageHandler(group_chats & filters.ALL, gate_unverified), group=0)
 
 # Commands
@@ -641,7 +650,6 @@ async def on_startup():
     await application.start()
     try:
         if WEBHOOK_URL:
-            # Explicit allowed updates to ensure delivery of joins, requests, and messages
             allowed = ["message", "chat_member", "my_chat_member", "chat_join_request", "callback_query"]
             if secret_is_valid(WEBHOOK_SECRET):
                 await application.bot.set_webhook(
