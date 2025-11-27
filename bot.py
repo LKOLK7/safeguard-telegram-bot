@@ -2,8 +2,7 @@
 #!/usr/bin/env python
 """
 Safeguard Telegram Bot (Render-ready) + VirusTotal scanner
-- Prefers python-telegram-bot v20+ ApplicationBuilder.
-- Falls back to v13 Updater/Dispatcher if v20 isn't available.
+- Uses python-telegram-bot v20+ ApplicationBuilder only (no v13 fallback).
 - Permanent CAPTCHA gate; diagnostic logging; explicit allowed_updates on webhook.
 
 Env vars (Render):
@@ -17,7 +16,7 @@ import logging
 import asyncio
 from datetime import datetime, timedelta
 
-# --- Optional dependency guard (so the app boots even if requests isn't installed yet)
+# Optional dependency guard (so the app boots even if requests isn't installed yet)
 try:
     import requests
 except ImportError:
@@ -28,7 +27,7 @@ from telegram import (
 )
 from telegram.helpers import escape_markdown
 
-# --- Web framework for webhook
+# Web framework for webhook
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse
@@ -41,7 +40,7 @@ logger = logging.getLogger("safeguard-bot")
 # ----------------- Environment -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # must be A-Z a-z 0-9 _ -
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # A-Z a-z 0-9 _ -
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
@@ -58,13 +57,13 @@ BLOCK_LINKS = True
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
-MUTE_SECONDS = 60  # general moderation; CAPTCHA gate is permanent until verify
+MUTE_SECONDS = 60
 
 # State
 PENDING_CAPTCHA = {}   # user_id -> {"chat_id": ..., "answer": ...}
 USER_WARNINGS = {}     # (chat_id, user_id) -> count
 USER_MSG_TIMES = {}    # (chat_id, user_id) -> [timestamps]
-UNVERIFIED = set()     # {(chat_id, user_id)} under CAPTCHA gate
+UNVERIFIED = set()     # {(chat_id, user_id)}
 
 ENGINES_FOR_PROGRESS = [
     "Kaspersky", "Avast", "BitDefender", "ESET-NOD32", "Microsoft", "Sophos", "TrendMicro",
@@ -74,7 +73,7 @@ ENGINES_FOR_PROGRESS = [
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# Link/mention detection (alternation)
+# Links/mentions
 URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)", re.IGNORECASE)
 def contains_link(text: str) -> bool:
     return bool(URL_REGEX.search(text or ""))
@@ -123,10 +122,9 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     return len(USER_MSG_TIMES[key])
 
 def secret_is_valid(token: str) -> bool:
-    # Telegram Bot API secret_token rules (A-Z a-z 0-9 _ - ; 1..256)
     return bool(re.match(r'^[A-Za-z0-9_\-]{1,256}$', token))
 
-# ----------------- Diagnostics: log every update type -----------------
+# ----------------- Diagnostics -----------------
 async def log_all_updates(update: Update, context):
     types = []
     if update.message: types.append("message")
@@ -269,7 +267,7 @@ async def togglelinks(update: Update, context):
     BLOCK_LINKS = not BLOCK_LINKS
     await update.effective_message.reply_text(f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
 
-# ----------------- Gate: block non-/start posts from unverified -----------------
+# ----------------- Gate for unverified -----------------
 async def gate_unverified(update: Update, context):
     chat = update.effective_chat
     user = update.effective_user
@@ -282,7 +280,7 @@ async def gate_unverified(update: Update, context):
         except Exception:
             pass
 
-# ----------------- Moderation handler -----------------
+# ----------------- Moderation -----------------
 async def moderate(update: Update, context):
     msg = update.effective_message
     user = msg.from_user
@@ -291,7 +289,6 @@ async def moderate(update: Update, context):
     if is_admin(user.id):
         return
 
-    # Flood control
     count = record_user_message(chat_id, user.id)
     if count > FLOOD_MAX_MSG:
         delete_message_safe(update, context)
@@ -299,7 +296,6 @@ async def moderate(update: Update, context):
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
         return
 
-    # Bad words
     if any(bad in text.lower() for bad in BAD_WORDS):
         delete_message_safe(update, context)
         total = add_warning(chat_id, user.id)
@@ -310,7 +306,6 @@ async def moderate(update: Update, context):
             await msg.reply_text(f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.")
         return
 
-    # Links
     if BLOCK_LINKS and contains_link(text):
         delete_message_safe(update, context)
         await msg.reply_text("🔗 Links are not allowed here. If it’s class-related, ask an admin.")
@@ -318,7 +313,7 @@ async def moderate(update: Update, context):
         if total >= WARN_LIMIT:
             await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
 
-# ----------------- New member verification + alert (CAPTCHA + UID) -----------------
+# ----------------- Verification -----------------
 async def welcome_verify(update: Update, context):
     chat_id = update.effective_chat.id
     for new_member in update.message.new_chat_members:
@@ -366,7 +361,6 @@ async def handle_join_request(update: Update, context):
 
 # ----------------- VirusTotal scanning -----------------
 async def vt_scan_and_report(file_path: str, progress_msg):
-    # Guard: if 'requests' isn’t installed, don’t crash the app
     if requests is None:
         await progress_msg.edit_text(
             "❌ The 'requests' library is not installed. Add it to requirements.txt and redeploy."
@@ -470,7 +464,7 @@ async def scan_photo(update: Update, context):
     progress_msg = await update.message.reply_text("⏳ Uploading image to VirusTotal and starting scan...")
     await vt_scan_and_report(file_path, progress_msg)
 
-# ----------------- Verify button callback -----------------
+# ----------------- Verify button -----------------
 async def verify_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -496,97 +490,51 @@ async def verify_callback(update: Update, context):
     except Exception as e:
         logger.debug(f"verify_callback error: {e}")
 
-# ----------------- Build PTB (v20 preferred; v13 fallback) -----------------
+# ----------------- PTB v20 Application -----------------
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in environment.")
 
-PTB_V20 = False
-application = None
-dispatcher = None
-bot_for_update = None
-group_chats_filter_v20 = None
+from telegram.ext import (
+    ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
+    ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter
+)
 
+builder = ApplicationBuilder().token(BOT_TOKEN)
 try:
-    # v20+ path
-    from telegram.ext import (
-        ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
-        ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter
-    )
-    builder = ApplicationBuilder().token(BOT_TOKEN)
-    try:
-        builder = builder.rate_limiter(AIORateLimiter())  # optional extra, installed via requirements
-    except Exception as e:
-        logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
-    application = builder.build()
-    bot_for_update = application.bot
-    PTB_V20 = True
-
-    # Diagnostics
-    application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
-
-    # Gate first
-    group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-    application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified), group=0)
-
-    # Commands
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("rules", cmd_rules))
-    application.add_handler(CommandHandler("report", cmd_report))
-    application.add_handler(CommandHandler("warnings", cmd_warnings))
-    application.add_handler(CommandHandler("function", cmd_function))
-    application.add_handler(CommandHandler("addbadword", addbadword))
-    application.add_handler(CommandHandler("removebadword", removebadword))
-    application.add_handler(CommandHandler("togglelinks", togglelinks))
-
-    # Moderation / join / scanners
-    application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate))
-    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))
-    application.add_handler(ChatJoinRequestHandler(handle_join_request))
-    application.add_handler(MessageHandler(group_chats_filter_v20 & filters.Document.ALL, scan_document))
-    application.add_handler(MessageHandler(group_chats_filter_v20 & filters.PHOTO, scan_photo))
-    application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
-    application.add_handler(ChatMemberHandler(lambda *_: None))
-
+    builder = builder.rate_limiter(AIORateLimiter())  # requires extras from requirements.txt
 except Exception as e:
-    # v13 fallback
-    logger.warning(f"PTB v20 path failed ({e}); falling back to PTB v13 dispatcher.")
-    from telegram.ext import (
-        Updater, Dispatcher, MessageHandler, CommandHandler, CallbackQueryHandler,
-        ChatMemberHandler, ChatJoinRequestHandler, Filters
-    )
-    updater = Updater(token=BOT_TOKEN, use_context=True)
-    dispatcher = updater.dispatcher
-    bot_for_update = updater.bot
+    logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
 
-    # Diagnostics
-    dispatcher.add_handler(MessageHandler(Filters.all, log_all_updates), group=-1)
+application = builder.build()
+bot_for_update = application.bot
 
-    # Gate first (no chat-type filter in v13)
-    dispatcher.add_handler(MessageHandler(Filters.all, gate_unverified), group=0)
+# Diagnostics
+application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
 
-    # Commands
-    dispatcher.add_handler(CommandHandler("start", cmd_start))
-    dispatcher.add_handler(CommandHandler("rules", cmd_rules))
-    dispatcher.add_handler(CommandHandler("report", cmd_report))
-    dispatcher.add_handler(CommandHandler("warnings", cmd_warnings))
-    dispatcher.add_handler(CommandHandler("function", cmd_function))
-    dispatcher.add_handler(CommandHandler("addbadword", addbadword))
-    dispatcher.add_handler(CommandHandler("removebadword", removebadword))
-    dispatcher.add_handler(CommandHandler("togglelinks", togglelinks))
+# Gate first
+group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified), group=0)
 
-    # Moderation / join / scanners
-    dispatcher.add_handler(MessageHandler((Filters.text | Filters.caption) & ~Filters.command, moderate))
-    dispatcher.add_handler(MessageHandler(Filters.status_update.new_chat_members, welcome_verify))
-    try:
-        dispatcher.add_handler(ChatJoinRequestHandler(handle_join_request))
-    except Exception:
-        pass
-    dispatcher.add_handler(MessageHandler(Filters.document, scan_document))
-    dispatcher.add_handler(MessageHandler(Filters.photo, scan_photo))
-    dispatcher.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
-    dispatcher.add_handler(ChatMemberHandler(lambda *_: None))
+# Commands
+application.add_handler(CommandHandler("start", cmd_start))
+application.add_handler(CommandHandler("rules", cmd_rules))
+application.add_handler(CommandHandler("report", cmd_report))
+application.add_handler(CommandHandler("warnings", cmd_warnings))
+application.add_handler(CommandHandler("function", cmd_function))
+application.add_handler(CommandHandler("addbadword", addbadword))
+application.add_handler(CommandHandler("removebadword", removebadword))
+application.add_handler(CommandHandler("togglelinks", togglelinks))
 
-# ----------------- Optional: commands menu -----------------
+# Moderation / join / scanners
+application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate))
+application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))
+application.add_handler(ChatJoinRequestHandler(handle_join_request))
+application.add_handler(MessageHandler(group_chats_filter_v20 & filters.Document.ALL, scan_document))
+application.add_handler(MessageHandler(group_chats_filter_v20 & filters.PHOTO, scan_photo))
+application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
+application.add_handler(ChatMemberHandler(lambda *_: None))
+
+# ----------------- Commands menu -----------------
 async def set_my_commands():
     try:
         cmds = [
@@ -596,10 +544,7 @@ async def set_my_commands():
             BotCommand("warnings", "Show your warnings"),
             BotCommand("function", "Show all bot functions"),
         ]
-        if PTB_V20:
-            await application.bot.set_my_commands(cmds)
-        else:
-            bot_for_update.set_my_commands(cmds)
+        await application.bot.set_my_commands(cmds)
     except Exception as e:
         logger.debug(f"set_my_commands failed: {e}")
 
@@ -611,7 +556,7 @@ async def root(request: Request):
     return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request):
-    # Check Telegram secret header if used (Bot API)
+    # Check Telegram secret header if used
     if secret_is_valid(WEBHOOK_SECRET):
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
@@ -622,12 +567,8 @@ async def webhook(request: Request):
     except Exception:
         return PlainTextResponse("bad request", status_code=400)
 
-    # Convert JSON to Update and hand it to PTB
     update = Update.de_json(data, bot_for_update)
-    if PTB_V20:
-        await application.process_update(update)
-    else:
-        dispatcher.process_update(update)
+    await application.process_update(update)
     return PlainTextResponse("ok")
 
 routes = [
@@ -637,47 +578,46 @@ routes = [
 ]
 app = Starlette(routes=routes)
 
-# ----------------- Startup/Shutdown: register webhook with explicit allowed_updates -----------------
+# ----------------- Startup/Shutdown -----------------
 @app.on_event("startup")
 async def on_startup():
     logger.info("Application starting …")
-    if PTB_V20:
-        await application.initialize()
-        await application.start()
-        # Ensure we receive join events & requests
-        allowed = ["message", "chat_member", "my_chat_member", "chat_join_request", "callback_query"]
-        try:
-            if WEBHOOK_URL:
-                if secret_is_valid(WEBHOOK_SECRET):
-                    await bot_for_update.set_webhook(
-                        url=WEBHOOK_URL,
-                        secret_token=WEBHOOK_SECRET,
-                        allowed_updates=allowed,
-                        drop_pending_updates=True,
-                    )
-                    logger.info(f"Webhook set to {WEBHOOK_URL} with secret; allowed_updates={allowed}")
-                else:
-                    await bot_for_update.set_webhook(
-                        url=WEBHOOK_URL,
-                        allowed_updates=allowed,
-                        drop_pending_updates=True,
-                    )
-                    logger.info(f"Webhook set to {WEBHOOK_URL} (no secret); allowed_updates={allowed}")
-        except Exception as e:
-            logger.error(f"set_webhook failed: {e}")
-            raise
+
+    await application.initialize()
+    await application.start()
+
+    allowed = ["message", "chat_member", "my_chat_member", "chat_join_request", "callback_query"]
+    try:
+        if WEBHOOK_URL:
+            if secret_is_valid(WEBHOOK_SECRET):
+                await bot_for_update.set_webhook(
+                    url=WEBHOOK_URL,
+                    secret_token=WEBHOOK_SECRET,
+                    allowed_updates=allowed,
+                    drop_pending_updates=True,
+                )
+                logger.info(f"Webhook set to {WEBHOOK_URL} with secret; allowed_updates={allowed}")
+            else:
+                await bot_for_update.set_webhook(
+                    url=WEBHOOK_URL,
+                    allowed_updates=allowed,
+                    drop_pending_updates=True,
+                )
+                logger.info(f"Webhook set to {WEBHOOK_URL} (no secret); allowed_updates={allowed}")
+    except Exception as e:
+        logger.error(f"set_webhook failed: {e}")
+        raise
+
     await set_my_commands()
     logger.info("Application started.")
 
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("Application stopping …")
-    if PTB_V20:
-        await application.stop()
+    await application.stop()
     logger.info("Application stopped.")
 
 # ----------------- Main (Render: python bot.py) -----------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
-    uvicorn.run("bot:app", host="0.0.0.0", port=port, workers=1)
