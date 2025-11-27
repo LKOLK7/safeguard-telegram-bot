@@ -1,22 +1,32 @@
 
 #!/usr/bin/env python
 """
-Safeguard Telegram Bot (Render-ready) + VirusTotal scanner
-- Uses python-telegram-bot v20+ ApplicationBuilder only (no v13 fallback).
-- Permanent CAPTCHA gate; diagnostic logging; explicit allowed_updates on webhook.
+Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal scanner
+
+Key design choices:
+- Uses python-telegram-bot v20+ ApplicationBuilder with .updater(None) for a custom Starlette webhook,
+  following PTB's official custom-webhook example (Starlette).  [Docs]  ⟶  https://docs.python-telegram-bot.org/en/stable/examples.customwebhookbot.html
+- Startup does NOT raise if Telegram set_webhook fails (avoids "Application exited early" on Render).  [Docs] ⟶ https://render.com/docs/troubleshooting-python-deploys
 
 Env vars (Render):
   BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET (optional), VT_API_KEY (optional),
-  RENDER_EXTERNAL_URL (auto)
+  RENDER_EXTERNAL_URL (auto, used to build WEBHOOK_URL)
+
+Routes:
+  GET  /          -> "OK"
+  GET  /healthz   -> {"status":"ok"}
+  POST /webhook   -> receives Telegram Update JSON (with optional secret header)
 """
+
 import os
 import re
+import sys
 import random
 import logging
 import asyncio
 from datetime import datetime, timedelta
 
-# Optional dependency guard (so the app boots even if requests isn't installed yet)
+# --- Optional dependency guard (VirusTotal HTTP client)
 try:
     import requests
 except ImportError:
@@ -26,11 +36,12 @@ from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.helpers import escape_markdown
+import telegram  # for version logging
 
-# Web framework for webhook
+# --- Web framework for webhook
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
 # ----------------- Logging -----------------
@@ -40,7 +51,7 @@ logger = logging.getLogger("safeguard-bot")
 # ----------------- Environment -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # A-Z a-z 0-9 _ -
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # allowed: A-Z a-z 0-9 _ -  (Bot API)
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
@@ -63,7 +74,7 @@ MUTE_SECONDS = 60
 PENDING_CAPTCHA = {}   # user_id -> {"chat_id": ..., "answer": ...}
 USER_WARNINGS = {}     # (chat_id, user_id) -> count
 USER_MSG_TIMES = {}    # (chat_id, user_id) -> [timestamps]
-UNVERIFIED = set()     # {(chat_id, user_id)}
+UNVERIFIED = set()     # {(chat_id, user_id)} under CAPTCHA gate
 
 ENGINES_FOR_PROGRESS = [
     "Kaspersky", "Avast", "BitDefender", "ESET-NOD32", "Microsoft", "Sophos", "TrendMicro",
@@ -73,7 +84,7 @@ ENGINES_FOR_PROGRESS = [
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# Links/mentions
+# Link/mention detection (alternation)
 URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)", re.IGNORECASE)
 def contains_link(text: str) -> bool:
     return bool(URL_REGEX.search(text or ""))
@@ -122,6 +133,7 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     return len(USER_MSG_TIMES[key])
 
 def secret_is_valid(token: str) -> bool:
+    # Bot API: secret_token allowed chars A-Z a-z 0-9 _ - (1..256)  (see Telegram Bot API docs)
     return bool(re.match(r'^[A-Za-z0-9_\-]{1,256}$', token))
 
 # ----------------- Diagnostics -----------------
@@ -490,7 +502,7 @@ async def verify_callback(update: Update, context):
     except Exception as e:
         logger.debug(f"verify_callback error: {e}")
 
-# ----------------- PTB v20 Application -----------------
+# ----------------- PTB v20 Application (no Updater; custom webhook) -----------------
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in environment.")
 
@@ -499,9 +511,15 @@ from telegram.ext import (
     ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter
 )
 
-builder = ApplicationBuilder().token(BOT_TOKEN)
+# Log versions & URLs early
+logger.info(f"Python: {sys.version}")
+logger.info(f"python-telegram-bot: {telegram.__version__}")
+logger.info(f"RENDER_EXTERNAL_URL: {os.getenv('RENDER_EXTERNAL_URL')}")
+logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
+
+builder = ApplicationBuilder().token(BOT_TOKEN).updater(None)  # critical for custom webhook (no PTB Updater)  [PTB ex]
 try:
-    builder = builder.rate_limiter(AIORateLimiter())  # requires extras from requirements.txt
+    builder = builder.rate_limiter(AIORateLimiter())  # requires [rate-limiter] extra
 except Exception as e:
     logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
 
@@ -555,8 +573,8 @@ async def healthz(request: Request):
 async def root(request: Request):
     return PlainTextResponse("OK", status_code=200)
 
-async def webhook(request: Request):
-    # Check Telegram secret header if used
+async def webhook(request: Request) -> Response:
+    # Optional secret header check (Bot API)
     if secret_is_valid(WEBHOOK_SECRET):
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
@@ -567,9 +585,9 @@ async def webhook(request: Request):
     except Exception:
         return PlainTextResponse("bad request", status_code=400)
 
-    update = Update.de_json(data, bot_for_update)
-    await application.process_update(update)
-    return PlainTextResponse("ok")
+    # Queue the update for PTB to process (per PTB custom-webhook example)
+    await application.update_queue.put(Update.de_json(data=data, bot=bot_for_update))
+    return Response()
 
 routes = [
     Route("/", root, methods=["GET"]),
@@ -581,12 +599,14 @@ app = Starlette(routes=routes)
 # ----------------- Startup/Shutdown -----------------
 @app.on_event("startup")
 async def on_startup():
-    logger.info("Application starting …")
+    logger.info(f"Application starting … WEBHOOK_URL={WEBHOOK_URL!r} secret_valid={secret_is_valid(WEBHOOK_SECRET)}")
 
+    # Initialize + start PTB application (no Updater; we use our Starlette endpoint)
     await application.initialize()
     await application.start()
 
-    allowed = ["message", "chat_member", "my_chat_member", "chat_join_request", "callback_query"]
+    # Register webhook (do NOT raise on failure; keep serving)
+    allowed = Update.ALL_TYPES  # PTB recommends explicit allowed_updates to avoid missing types
     try:
         if WEBHOOK_URL:
             if secret_is_valid(WEBHOOK_SECRET):
@@ -604,9 +624,11 @@ async def on_startup():
                     drop_pending_updates=True,
                 )
                 logger.info(f"Webhook set to {WEBHOOK_URL} (no secret); allowed_updates={allowed}")
+        else:
+            logger.warning("WEBHOOK_URL is empty; skipping set_webhook.")
     except Exception as e:
         logger.error(f"set_webhook failed: {e}")
-        raise
+        # Do NOT crash the process; keep running to pass health checks and accept later updates
 
     await set_my_commands()
     logger.info("Application started.")
@@ -614,10 +636,15 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("Application stopping …")
-    await application.stop()
+    # Stop PTB application
+    try:
+        await application.stop()
+    except Exception as e:
+        logger.warning(f"Error stopping application: {e}")
     logger.info("Application stopped.")
 
 # ----------------- Main (Render: python bot.py) -----------------
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
+    uvicorn.run("bot:app", host="0.0.0.0", port=port, workers=1)
