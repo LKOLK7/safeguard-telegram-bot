@@ -3,12 +3,12 @@
 """
 Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal scanner
 
-Key design choices:
-- Uses python-telegram-bot v20+ ApplicationBuilder with .updater(None) for a custom Starlette webhook,
-  following PTB's official custom-webhook example (Starlette).  [Docs]  ⟶  https://docs.python-telegram-bot.org/en/stable/examples.customwebhookbot.html
-- Startup does NOT raise if Telegram set_webhook fails (avoids "Application exited early" on Render).  [Docs] ⟶ https://render.com/docs/troubleshooting-python-deploys
+Design:
+- python-telegram-bot v20 ApplicationBuilder with .updater(None) for a custom Starlette webhook
+- Startup does NOT raise on set_webhook failure (avoids "Application exited early" on Render)
+- Group diagnostics: error handler + logs in /start to pinpoint permission/context issues
 
-Env vars (Render):
+Env vars:
   BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET (optional), VT_API_KEY (optional),
   RENDER_EXTERNAL_URL (auto, used to build WEBHOOK_URL)
 
@@ -26,7 +26,7 @@ import logging
 import asyncio
 from datetime import datetime, timedelta
 
-# --- Optional dependency guard (VirusTotal HTTP client)
+# Optional dependency guard for VirusTotal
 try:
     import requests
 except ImportError:
@@ -36,9 +36,9 @@ from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.helpers import escape_markdown
-import telegram  # for version logging
+import telegram  # version logging
 
-# --- Web framework for webhook
+# Starlette web server
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -51,7 +51,7 @@ logger = logging.getLogger("safeguard-bot")
 # ----------------- Environment -----------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # allowed: A-Z a-z 0-9 _ -  (Bot API)
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # allowed: A-Z a-z 0-9 _ -
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
@@ -84,7 +84,6 @@ ENGINES_FOR_PROGRESS = [
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# Link/mention detection (alternation)
 URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)", re.IGNORECASE)
 def contains_link(text: str) -> bool:
     return bool(URL_REGEX.search(text or ""))
@@ -133,7 +132,6 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     return len(USER_MSG_TIMES[key])
 
 def secret_is_valid(token: str) -> bool:
-    # Bot API: secret_token allowed chars A-Z a-z 0-9 _ - (1..256)  (see Telegram Bot API docs)
     return bool(re.match(r'^[A-Za-z0-9_\-]{1,256}$', token))
 
 # ----------------- Diagnostics -----------------
@@ -157,11 +155,21 @@ async def log_all_updates(update: Update, context):
 
 # ----------------- Commands -----------------
 async def cmd_start(update: Update, context):
-    await update.message.reply_text(
-        "Hello! I keep this group safe—moderation, anti-spam, and new member verification.\n"
-        "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins.\n\n"
-        "You can also send a file or photo and I’ll **scan it with VirusTotal** to check for malware."
+    # Helpful group diagnostics
+    logger.info(
+        f"/start in chat_id={update.effective_chat.id}, type={update.effective_chat.type}, "
+        f"is_topic_message={getattr(update.message, 'is_topic_message', False)}, "
+        f"user_id={update.effective_user.id}"
     )
+    try:
+        await update.message.reply_text(
+            "Hello! I keep this group safe—moderation, anti-spam, and new member verification.\n"
+            "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins.\n\n"
+            "You can also send a file or photo and I’ll **scan it with VirusTotal** to check for malware."
+        )
+    except Exception as e:
+        # If the bot lacks permission to send in this chat/topic, log the error clearly
+        logger.error(f"/start reply failed in chat {update.effective_chat.id}: {e}")
 
 async def cmd_rules(update: Update, context):
     await update.message.reply_text(
@@ -188,6 +196,13 @@ async def cmd_report(update: Update, context):
 async def cmd_warnings(update: Update, context):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
     await update.message.reply_text(f"Your current warnings: {count}")
+
+# Quick test command
+async def cmd_ping(update: Update, context):
+    try:
+        await update.message.reply_text("🏓 pong")
+    except Exception as e:
+        logger.error(f"/ping reply failed in chat {update.effective_chat.id}: {e}")
 
 async def cmd_function(update: Update, context):
     text = (
@@ -502,7 +517,7 @@ async def verify_callback(update: Update, context):
     except Exception as e:
         logger.debug(f"verify_callback error: {e}")
 
-# ----------------- PTB v20 Application (no Updater; custom webhook) -----------------
+# ----------------- PTB v20 Application (custom webhook; no Updater) -----------------
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing. Set it in environment.")
 
@@ -511,20 +526,25 @@ from telegram.ext import (
     ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter
 )
 
-# Log versions & URLs early
+# Version & URL diagnostics
 logger.info(f"Python: {sys.version}")
 logger.info(f"python-telegram-bot: {telegram.__version__}")
 logger.info(f"RENDER_EXTERNAL_URL: {os.getenv('RENDER_EXTERNAL_URL')}")
 logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
 
-builder = ApplicationBuilder().token(BOT_TOKEN).updater(None)  # critical for custom webhook (no PTB Updater)  [PTB ex]
+builder = ApplicationBuilder().token(BOT_TOKEN).updater(None)
 try:
-    builder = builder.rate_limiter(AIORateLimiter())  # requires [rate-limiter] extra
+    builder = builder.rate_limiter(AIORateLimiter())
 except Exception as e:
     logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
 
 application = builder.build()
 bot_for_update = application.bot
+
+# Global error handler so we see permission problems in group replies
+async def on_error(update: object, context):
+    logger.error("Handler error", exc_info=context.error)
+application.add_error_handler(on_error)
 
 # Diagnostics
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
@@ -539,6 +559,7 @@ application.add_handler(CommandHandler("rules", cmd_rules))
 application.add_handler(CommandHandler("report", cmd_report))
 application.add_handler(CommandHandler("warnings", cmd_warnings))
 application.add_handler(CommandHandler("function", cmd_function))
+application.add_handler(CommandHandler("ping", cmd_ping))
 application.add_handler(CommandHandler("addbadword", addbadword))
 application.add_handler(CommandHandler("removebadword", removebadword))
 application.add_handler(CommandHandler("togglelinks", togglelinks))
@@ -561,6 +582,7 @@ async def set_my_commands():
             BotCommand("report", "Report an issue to admins"),
             BotCommand("warnings", "Show your warnings"),
             BotCommand("function", "Show all bot functions"),
+            BotCommand("ping", "Quick connectivity test"),
         ]
         await application.bot.set_my_commands(cmds)
     except Exception as e:
@@ -574,7 +596,7 @@ async def root(request: Request):
     return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request) -> Response:
-    # Optional secret header check (Bot API)
+    # Optional secret header check
     if secret_is_valid(WEBHOOK_SECRET):
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
@@ -585,7 +607,7 @@ async def webhook(request: Request) -> Response:
     except Exception:
         return PlainTextResponse("bad request", status_code=400)
 
-    # Queue the update for PTB to process (per PTB custom-webhook example)
+    # Feed the update into PTB (custom webhook pattern)
     await application.update_queue.put(Update.de_json(data=data, bot=bot_for_update))
     return Response()
 
@@ -601,12 +623,11 @@ app = Starlette(routes=routes)
 async def on_startup():
     logger.info(f"Application starting … WEBHOOK_URL={WEBHOOK_URL!r} secret_valid={secret_is_valid(WEBHOOK_SECRET)}")
 
-    # Initialize + start PTB application (no Updater; we use our Starlette endpoint)
     await application.initialize()
     await application.start()
 
-    # Register webhook (do NOT raise on failure; keep serving)
-    allowed = Update.ALL_TYPES  # PTB recommends explicit allowed_updates to avoid missing types
+    # Register webhook (avoid crashing if it fails)
+    allowed = Update.ALL_TYPES
     try:
         if WEBHOOK_URL:
             if secret_is_valid(WEBHOOK_SECRET):
@@ -628,7 +649,7 @@ async def on_startup():
             logger.warning("WEBHOOK_URL is empty; skipping set_webhook.")
     except Exception as e:
         logger.error(f"set_webhook failed: {e}")
-        # Do NOT crash the process; keep running to pass health checks and accept later updates
+        # Keep serving so health checks pass and you can fix webhook later
 
     await set_my_commands()
     logger.info("Application started.")
@@ -636,7 +657,6 @@ async def on_startup():
 @app.on_event("shutdown")
 async def on_shutdown():
     logger.info("Application stopping …")
-    # Stop PTB application
     try:
         await application.stop()
     except Exception as e:
