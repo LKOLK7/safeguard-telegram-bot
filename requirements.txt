@@ -1,4 +1,4 @@
-python-telegram-bot==20.7
+python-telegram-bot[rate-limiter]==20.7
 starlette==0.38.2
 uvicorn[standard]==0.30.1
 requests==2.32.3
