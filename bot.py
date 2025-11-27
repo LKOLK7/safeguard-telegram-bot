@@ -5,10 +5,10 @@ Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal s
 
 Highlights:
 - PTB v20 custom webhook (.updater(None)).
-- Global Defaults(block=False) so multiple handlers can run per update.
+- Global Defaults(block=False) so multiple handlers can run per update.  (PTB concurrency model)
 - Deletion is async + awaited everywhere.
-- Non-admin admin commands: delete the offending command + warn only.
-- Bad words/links: delete + warn (mute only after WARN_LIMIT).
+- Scan documents & photos in BOTH group and DM (filters.Document.ALL & filters.PHOTO).
+- New member alert (details posted to the group).
 - Robust startup: log PORT, run uvicorn with app object, never crash on set_webhook failures.
 """
 
@@ -30,7 +30,7 @@ from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.helpers import escape_markdown
-import telegram  # version logging
+import telegram
 
 # Starlette web server
 from starlette.applications import Starlette
@@ -335,60 +335,11 @@ async def moderate(update: Update, context):
         if total >= WARN_LIMIT:
             await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
 
-# ----------------- Verification -----------------
-async def welcome_verify(update: Update, context):
-    chat_id = update.effective_chat.id
-    for new_member in update.message.new_chat_members:
-        UNVERIFIED.add((chat_id, new_member.id))
-        await restrict_user(chat_id, new_member.id, context, until_date=None)
-
-        correct = random.randint(1, 4)
-        options = list(range(1, 5))
-        random.shuffle(options)
-        keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify:{new_member.id}:{int(n==correct)}")] for n in options]
-        PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct}
-        await context.bot.send_message(
-            chat_id,
-            (f"👋 Welcome, @{new_member.username or new_member.first_name}!\n"
-             f"Please verify: pick **{correct}** to unlock chatting.\n"
-             f"UID: `{new_member.id}`"),
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode="Markdown"
-        )
-
-        uid = new_member.id
-        is_bot = "true" if new_member.is_bot else "false"
-        first_name = new_member.first_name or "-"
-        last_name = new_member.last_name or "-"
-        uname = new_member.username or "-"
-        ulink = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
-        lang = getattr(new_member, "language_code", None) or "-"
-        alert_text = (
-            "📣 NEW MEMBER ALERT\n"
-            f"• UID: {uid}\n"
-            f"• is_bot: {is_bot}\n"
-            f"• first_name: {first_name}\n"
-            f"• last_name: {last_name}\n"
-            f"• username: {uname} {ulink}\n"
-            f"• language_code: {lang}"
-        )
-        await context.bot.send_message(chat_id, alert_text)
-
-async def handle_join_request(update: Update, context):
-    req = update.chat_join_request
-    chat_id = req.chat.id
-    user_id = req.from_user.id
-    UNVERIFIED.add((chat_id, user_id))
-    logger.info(f"JOIN REQUEST: marked UNVERIFIED {(chat_id, user_id)}")
-
 # ----------------- VirusTotal scanning -----------------
 async def vt_scan_and_report(file_path: str, progress_msg):
     if requests is None:
-        await progress_msg.edit_text(
-            "❌ The 'requests' library is not installed. Add it to requirements.txt and redeploy."
-        )
+        await progress_msg.edit_text("❌ The 'requests' library is not installed. Add it to requirements.txt and redeploy.")
         return
-
     if not VT_API_KEY:
         await progress_msg.edit_text("❌ VirusTotal API key is not configured (VT_API_KEY).")
         return
@@ -473,6 +424,7 @@ async def vt_scan_and_report(file_path: str, progress_msg):
         logger.error(f"Error deleting file after timeout: {e}")
 
 async def scan_document(update: Update, context):
+    """Scan any document (group or DM)."""
     doc = update.message.document
     file = await doc.get_file()
     file_path = await file.download_to_drive()
@@ -480,6 +432,7 @@ async def scan_document(update: Update, context):
     await vt_scan_and_report(file_path, progress_msg)
 
 async def scan_photo(update: Update, context):
+    """Scan any photo (group or DM)."""
     photo = update.message.photo[-1]
     file = await photo.get_file()
     file_path = await file.download_to_drive()
@@ -522,17 +475,15 @@ from telegram.ext import (
 )
 from telegram.constants import MessageEntityType
 
-# Version & URL diagnostics
 logger.info(f"Python: {sys.version}")
 logger.info(f"python-telegram-bot: {telegram.__version__}")
 logger.info(f"RENDER_EXTERNAL_URL: {os.getenv('RENDER_EXTERNAL_URL')}")
 logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
 
-# Non-blocking handlers globally + custom webhook
 builder = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
-    .updater(None)                   # custom webhook pattern
+    .updater(None)                   # custom webhook pattern; PTB example uses updater(None)
     .defaults(Defaults(block=False)) # allow multiple handlers per update
 )
 try:
@@ -569,6 +520,12 @@ application.add_handler(CommandHandler("addbadword", addbadword, block=False), g
 application.add_handler(CommandHandler("removebadword", removebadword, block=False), group=1)
 application.add_handler(CommandHandler("togglelinks", togglelinks, block=False), group=1)
 
+# NEW: Universal scan handlers (group & DM) — group=1 so they run alongside commands
+application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)  # scans docs anywhere
+application.add_handler(MessageHandler(filters.PHOTO,         scan_photo,    block=False), group=1)  # scans photos anywhere
+# (filters.Document.ALL and filters.PHOTO are the correct PTB v20 filters for documents/photos)  # docs: filters module
+#                                                                                                  # see references below
+
 # Group command tap (after commands)
 async def group_command_tap(update: Update, context):
     msg = update.message
@@ -593,9 +550,7 @@ application.add_handler(MessageHandler(filters.COMMAND & group_chats_filter_v20,
 
 # Moderation / join / scanners
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate))
-application.add_handler(MessageHandler(group_chats_filter_v20 & filters.Document.ALL, scan_document))
-application.add_handler(MessageHandler(group_chats_filter_v20 & filters.PHOTO, scan_photo))
-application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))
+application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify))  # join alert to group
 application.add_handler(ChatJoinRequestHandler(handle_join_request))
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
 application.add_handler(ChatMemberHandler(lambda *_: None))
@@ -685,7 +640,6 @@ async def on_startup():
             logger.warning("WEBHOOK_URL is empty; skipping set_webhook.")
     except Exception as e:
         logger.error(f"set_webhook failed: {e}")
-        # Keep serving so health checks pass and you can fix webhook later
 
     await set_my_commands()
     logger.info("Application started.")
@@ -705,8 +659,6 @@ if __name__ == "__main__":
     port = int(os.getenv("PORT", "10000"))
     logger.info(f"Starting Uvicorn on 0.0.0.0:{port}")
     try:
-        # Run with the app object (avoids import path issues like 'bot:app')
         uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
     except Exception as e:
         logger.exception(f"Fatal error starting Uvicorn: {e}")
-        raise
