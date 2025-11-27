@@ -3,20 +3,12 @@
 """
 Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal scanner
 
-Design:
-- PTB v20 ApplicationBuilder with .updater(None) for a custom Starlette webhook (per PTB example).
-- Startup does NOT raise on set_webhook failure (avoids "Application exited early" on Render).
-- Group diagnostics: error handler + logs in /start, a group command tap that extracts the command target
-  and compares it with our actual @username; optional guidance if mismatched.
-
-Env vars:
-  BOT_TOKEN, ADMIN_IDS, WEBHOOK_SECRET (optional), VT_API_KEY (optional),
-  RENDER_EXTERNAL_URL (auto, used to build WEBHOOK_URL)
-
-Routes:
-  GET  /          -> "OK"
-  GET  /healthz   -> {"status":"ok"}
-  POST /webhook   -> receives Telegram Update JSON (with optional secret header)
+Key fixes:
+- Use PTB v20 custom webhook pattern (.updater(None)).
+- Make handlers non-blocking so commands run after gate_unverified:
+  * Global Defaults(block=False) + gate_unverified(block=False).
+  (PTB handlers can block subsequent handlers; turning this off lets multiple handlers
+   in the same group run for one update.)  See refs in README.  [PTB concurrency]
 """
 
 import os
@@ -156,7 +148,6 @@ async def log_all_updates(update: Update, context):
 
 # ----------------- Commands -----------------
 async def cmd_start(update: Update, context):
-    # Helpful group diagnostics
     logger.info(
         f"/start in chat_id={update.effective_chat.id}, type={update.effective_chat.type}, "
         f"is_topic_message={getattr(update.message, 'is_topic_message', False)}, "
@@ -169,7 +160,6 @@ async def cmd_start(update: Update, context):
             "You can also send a file or photo and I’ll **scan it with VirusTotal** to check for malware."
         )
     except Exception as e:
-        # If the bot lacks permission to send in this chat/topic, log the error clearly
         logger.error(f"/start reply failed in chat {update.effective_chat.id}: {e}")
 
 async def cmd_rules(update: Update, context):
@@ -198,7 +188,6 @@ async def cmd_warnings(update: Update, context):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
     await update.message.reply_text(f"Your current warnings: {count}")
 
-# Quick connectivity test
 async def cmd_ping(update: Update, context):
     try:
         await update.message.reply_text("🏓 pong")
@@ -524,7 +513,7 @@ if not BOT_TOKEN:
 
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
-    ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter
+    ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter, Defaults
 )
 from telegram.constants import MessageEntityType
 
@@ -534,19 +523,24 @@ logger.info(f"python-telegram-bot: {telegram.__version__}")
 logger.info(f"RENDER_EXTERNAL_URL: {os.getenv('RENDER_EXTERNAL_URL')}")
 logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
 
-builder = ApplicationBuilder().token(BOT_TOKEN).updater(None)  # custom webhook (PTB example)
+# Make handlers non-blocking by default (so multiple handlers in the same group can run)
+builder = (
+    ApplicationBuilder()
+    .token(BOT_TOKEN)
+    .updater(None)                     # custom webhook pattern (PTB example)
+    .defaults(Defaults(block=False))   # <-- global non-blocking handlers
+)
 try:
-    builder = builder.rate_limiter(AIORateLimiter())  # optional extra installed via requirements
+    builder = builder.rate_limiter(AIORateLimiter())
 except Exception as e:
     logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
 
 application = builder.build()
 bot_for_update = application.bot
 
-# Will be filled on startup with exact bot username
-BOT_USERNAME = None
+BOT_USERNAME = None  # set on startup
 
-# Global error handler so we see permission problems in group replies
+# Global error handler (see permission problems, etc.)
 async def on_error(update: object, context):
     logger.error("Handler error", exc_info=context.error)
 application.add_error_handler(on_error)
@@ -554,11 +548,14 @@ application.add_error_handler(on_error)
 # Diagnostics
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
 
-# Gate first
+# Gate first — but explicitly non-blocking so commands still run in this group
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified), group=0)
+application.add_handler(
+    MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False),
+    group=0,
+)
 
-# Commands
+# Commands (group 0)
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("rules", cmd_rules))
 application.add_handler(CommandHandler("report", cmd_report))
@@ -569,7 +566,7 @@ application.add_handler(CommandHandler("addbadword", addbadword))
 application.add_handler(CommandHandler("removebadword", removebadword))
 application.add_handler(CommandHandler("togglelinks", togglelinks))
 
-# --- Group command tap (extract target username, compare, and optionally guide) ---
+# --- Group command tap (after commands) to show targeting/permissions ---
 async def group_command_tap(update: Update, context):
     msg = update.message
     txt = msg.text or ""
@@ -581,10 +578,9 @@ async def group_command_tap(update: Update, context):
             cmd = txt[e.offset:e.offset + e.length]
             command_root = cmd.split('@', 1)[0]  # '/start' or '/ping'
             if '@' in cmd:
-                target = cmd.split('@', 1)[1]  # username after '@'
+                target = cmd.split('@', 1)[1]    # username after '@'
             break
 
-    # Log command & target
     try:
         me = await context.bot.get_me()
         cm = await context.bot.get_chat_member(update.effective_chat.id, me.id)
@@ -594,15 +590,6 @@ async def group_command_tap(update: Update, context):
         )
     except Exception as e:
         logger.debug(f"get_chat_member failed: {e}")
-
-    # If addressed to a different bot, help the user (optional hint)
-    if target and BOT_USERNAME and target.lower() != BOT_USERNAME.lower():
-        hint = f"ℹ️ This command is addressed to @{target}, not me (@{BOT_USERNAME}). " \
-               f"Use {command_root}@{BOT_USERNAME}."
-        try:
-            await msg.reply_text(hint)
-        except Exception as e:
-            logger.error(f"Guidance message failed in chat {update.effective_chat.id}: {e}")
 
 application.add_handler(MessageHandler(filters.COMMAND & group_chats_filter_v20, group_command_tap), group=1)
 
