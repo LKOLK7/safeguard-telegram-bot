@@ -3,12 +3,13 @@
 """
 Safeguard Telegram Bot (Render-ready, PTB v20, Starlette webhook) + VirusTotal scanner
 
-Highlights in this version:
+Highlights:
 - PTB v20 custom webhook (.updater(None)).
 - Global Defaults(block=False) so multiple handlers can run per update.
-- FIXED deletion: delete_message_safe is async + all calls now `await` it.
-- Non-admin use of admin commands: offending message is DELETED + user gets a warning.
-- Bad words/links: offending message is DELETED + user gets a warning/mute escalation.
+- Deletion is async + awaited everywhere.
+- Non-admin admin commands: delete the offending command + warn only.
+- Bad words/links: delete + warn (mute only after WARN_LIMIT).
+- Robust startup: log PORT, run uvicorn with app object, never crash on set_webhook failures.
 """
 
 import os
@@ -82,7 +83,7 @@ URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)
 def contains_link(text: str) -> bool:
     return bool(URL_REGEX.search(text or ""))
 
-# >>> FIX: make deletion async and await everywhere <<<
+# --- Deletion MUST be awaited ---
 async def delete_message_safe(update: Update, context):
     try:
         await context.bot.delete_message(update.effective_chat.id, update.effective_message.message_id)
@@ -702,3 +703,10 @@ async def on_shutdown():
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
+    logger.info(f"Starting Uvicorn on 0.0.0.0:{port}")
+    try:
+        # Run with the app object (avoids import path issues like 'bot:app')
+        uvicorn.run(app, host="0.0.0.0", port=port, workers=1)
+    except Exception as e:
+        logger.exception(f"Fatal error starting Uvicorn: {e}")
+        raise
