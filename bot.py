@@ -1,19 +1,27 @@
 
 #!/usr/bin/env python
-# Safeguard Telegram Bot (Render-ready, webhook + healthz) + VirusTotal scanner
-# 
-# Revision notes (2025-11-27):
-# - Permanent CAPTCHA gate: new members are restricted until they press the correct button (no 60s auto-unmute).
-# - Unverified gate handler: blocks ALL messages/commands from unverified users in group chats.
-# - Admin-only enforcement for /addbadword, /removebadword, /togglelinks (delete + warn + mute at WARN_LIMIT).
-# - New member alert prints UID clearly.
-# - Group-only VT scan handlers (optional).
-# - URL detection simplified & hardened.
-#
-# IMPORTANT:
-# - Bot MUST be Admin with "Restrict Members" to enforce the gate/mutes.
-# - Disable Group Privacy in BotFather so the bot receives normal group messages: /setprivacy → Disable; remove & re-add the bot.
-# - Set ADMIN_IDS env var to a comma-separated list of Telegram user IDs who are bot admins.
+"""
+Safeguard Telegram Bot (Render-ready) + VirusTotal scanner
+
+Revision (2025-11-27):
+- Permanent CAPTCHA gate: new members are restricted until they verify (no timed auto-unmute).
+- Gate handler blocks ALL messages/commands from unverified users in GROUP/SUPERGROUP chats.
+- Admin-only enforcement for /addbadword, /removebadword, /togglelinks (delete + warn + temp-mute).
+- New-member alert prints UID clearly.
+- Group-only VT scan handlers (optional; remove chat-type filter if you want DM scans too).
+- Starlette webhook + /healthz compatible with Render, with optional WEBHOOK_SECRET verification.
+
+Environment variables to set in Render:
+  BOT_TOKEN         : Telegram bot token from @BotFather
+  ADMIN_IDS         : Comma-separated numeric Telegram user IDs (e.g. "12345,67890")
+  WEBHOOK_SECRET    : Optional secret for Telegram webhook header; A-Z a-z 0-9 _ -
+  RENDER_EXTERNAL_URL: Render injects this automatically for the public URL (https://...)
+  VT_API_KEY        : Optional VirusTotal API key (v3); leave empty to disable scans
+
+NOTE:
+- Make the bot ADMIN in the group with "Restrict Members" + "Delete Messages".
+- Disable Group Privacy in @BotFather: /setprivacy -> Disable, then remove & re-add the bot to the group.
+"""
 
 import os
 import re
@@ -51,31 +59,31 @@ logger = logging.getLogger("safeguard-bot")
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")  # must be A-Z a-z 0-9 _ -
-BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")  # Render sets this automatically
-WEBHOOK_PATH = "/webhook"  # endpoint path on our server
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""  # full HTTPS URL for Telegram
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
 
 # VirusTotal API (v3)
 VT_API_KEY = os.getenv("VT_API_KEY", "")
 VT_FILE_SCAN_URL = "https://www.virustotal.com/api/v3/files"
 VT_ANALYSES_URL_TPL = "https://www.virustotal.com/api/v3/analyses/{}"
-VT_HEADERS = {"x-apikey": VT_API_KEY}  # v3 uses x-apikey header for authentication
+VT_HEADERS = {"x-apikey": VT_API_KEY}
 
-# Safeguard policies (customize as needed)
-BAD_WORDS = {"idiot", "stupid", "fool"}  # example list; add your own
+# Safeguard policies
+BAD_WORDS = {"idiot", "stupid", "fool"}  # example list; customize
 BLOCK_LINKS = True
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
 MUTE_SECONDS = 60  # for general moderation; CAPTCHA gate is permanent until verify
 
-# In-memory state (replace with DB if you need persistence)
+# In-memory state
 PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ...}
-USER_WARNINGS = {}  # (chat_id, user_id) -> count
-USER_MSG_TIMES = {}  # (chat_id, user_id) -> [timestamps]
-UNVERIFIED = set()   # set of (chat_id, user_id) currently under CAPTCHA gate
+USER_WARNINGS = {}    # (chat_id, user_id) -> count
+USER_MSG_TIMES = {}   # (chat_id, user_id) -> [timestamps]
+UNVERIFIED = set()    # set of (chat_id, user_id) currently under CAPTCHA gate
 
-# Progress banner for VT (rotates engines while waiting)
+# VT progress banner engines
 ENGINES_FOR_PROGRESS = [
     "Kaspersky", "Avast", "BitDefender", "ESET-NOD32", "Microsoft", "Sophos", "TrendMicro",
     "McAfee", "DrWeb", "Fortinet", "ClamAV", "Paloalto", "Malwarebytes", "VIPRE"
@@ -99,7 +107,7 @@ async def delete_message_safe(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.debug(f"Delete message failed: {e}")
 
 async def restrict_user(chat_id: int, user_id: int, context: ContextTypes.DEFAULT_TYPE, until_date=None):
-    """Restrict user; if until_date=None, restriction is effectively indefinite until changed."""
+    """Restrict user; if until_date=None, restriction is indefinite until changed."""
     perms = ChatPermissions(
         can_send_messages=False,
         can_send_media_messages=False,
@@ -152,7 +160,6 @@ async def enforce_admin_violation(update: Update, context: ContextTypes.DEFAULT_
             await msg.reply_text(f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s.")
         except Exception:
             pass
-        # temporary mute (time-boxed)
         await restrict_user(chat_id, user_id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
     else:
         try:
@@ -223,7 +230,7 @@ async def cmd_function(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "• Send a **file** or **photo** to automatically scan with **VirusTotal** and get a readable summary.\n"
         "  (Public API has rate limits; use wisely.)\n\n"
         "**Notes**\n"
-        "• For muting/restricting, the bot must be **admin** with 'Restrict Members' right.\n"
+        "• The bot must be **admin** with 'Restrict Members' + 'Delete Messages'.\n"
         "• Disable Group Privacy in BotFather so the bot can receive normal group messages."
     )
     await update.message.reply_text(text, parse_mode="Markdown")
@@ -282,9 +289,7 @@ async def gate_unverified(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     user = update.effective_user
     if chat.type in ("group", "supergroup") and (chat.id, user.id) in UNVERIFIED:
-        # Delete any message/command from unverified users
         await delete_message_safe(update, context)
-        # Optionally remind the user (post a short notice)
         try:
             await context.bot.send_message(chat.id, f"⛔ @{user.username or user.first_name}, please complete the CAPTCHA above to start chatting.")
         except Exception:
@@ -338,9 +343,9 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for new_member in update.message.new_chat_members:
         # 1) Permanently restrict new member until verification
         UNVERIFIED.add((chat_id, new_member.id))
-        await restrict_user(chat_id, new_member.id, context, until_date=None)  # permanent until unrestrict
+        await restrict_user(chat_id, new_member.id, context, until_date=None)
 
-        # 2) Build a verification challenge
+        # 2) Verification challenge
         correct = random.randint(1, 4)
         options = list(range(1, 5))
         random.shuffle(options)
@@ -349,7 +354,7 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ]
         PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct}
 
-        # 3) Send the verification prompt (print UID clearly)
+        # 3) Prompt + UID
         await context.bot.send_message(
             chat_id,
             (
@@ -361,7 +366,7 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-        # 4) Compose alert
+        # 4) Alert
         uid = new_member.id
         is_bot = "true" if new_member.is_bot else "false"
         first_name = new_member.first_name or "-"
@@ -385,13 +390,11 @@ async def welcome_verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 pass
 
-# For groups with "Approve new members" enabled: auto-gate on join request approval
+# If your group uses "Approve new members": pre-gate on approval
 async def handle_join_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     req = update.chat_join_request
     chat_id = req.chat.id
     user_id = req.from_user.id
-    # When admin approves, Telegram sends a service message NEW_CHAT_MEMBERS
-    # Here we proactively mark them as UNVERIFIED so the gate triggers reliably.
     UNVERIFIED.add((chat_id, user_id))
 
 # ------------------------------
@@ -537,11 +540,12 @@ application = (
 )
 
 # Register handlers
-# Gate unverified FIRST so it intercepts commands/messages
 group_chats = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-application.add_handler(MessageHandler(group_chats & (filters.ALL), gate_unverified), group=0)
 
-# Commands (will be blocked by gate_unverified for unverified users)
+# Gate unverified FIRST so it intercepts messages/commands
+application.add_handler(MessageHandler(group_chats & filters.ALL, gate_unverified), group=0)
+
+# Commands (blocked by gate_unverified for unverified users)
 application.add_handler(CommandHandler("start", cmd_start))
 application.add_handler(CommandHandler("rules", cmd_rules))
 application.add_handler(CommandHandler("report", cmd_report))
@@ -561,7 +565,7 @@ application.add_handler(MessageHandler(group_chats & filters.PHOTO, scan_photo))
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"))
 application.add_handler(ChatMemberHandler(lambda *_: None))
 
-# Optional: set Telegram command menu
+# Optional: command menu
 async def set_my_commands():
     try:
         await application.bot.set_my_commands([
@@ -584,6 +588,7 @@ async def root(request: Request):
     return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request):
+    # Verify secret token header from Telegram when set_webhook(..., secret_token=WEBHOOK_SECRET)
     if secret_is_valid(WEBHOOK_SECRET):
         hdr = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
         if hdr != WEBHOOK_SECRET:
@@ -632,8 +637,9 @@ async def on_shutdown():
     logger.info("Application stopped.")
 
 # ------------------------------
-# Main (Render: uses PORT env var)
+# Main (Render runs `python bot.py`)
 # ------------------------------
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", "10000"))
+    port = int(os.getenv("PORT", "10000"))  # Render sets PORT automatically
+    uvicorn.run("bot:app", host="0.0.0.0", port=port, workers=1)
