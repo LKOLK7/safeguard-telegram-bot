@@ -1,6 +1,6 @@
 
 #!/usr/bin/env python
-import os, re, sys, random, logging, asyncio, string
+import os, re, sys, random, logging, asyncio, string, json
 from datetime import datetime, timedelta
 
 # Optional dependency for VirusTotal
@@ -57,6 +57,10 @@ USER_MSG_TIMES = {}    # (chat_id, user_id) -> timestamps
 UNVERIFIED = set()     # {(chat_id, user_id)}
 BOT_USERNAME = None    # filled at startup
 
+# Username history (persistent)
+HIST_FILE = os.getenv("USERNAME_HISTORY_FILE", "username_history.json")
+USERNAME_HISTORY = {}  # user_id (str) -> [username1, username2, ...] (None allowed)
+
 ENGINES_FOR_PROGRESS = [
     "Kaspersky","Avast","BitDefender","ESET-NOD32","Microsoft","Sophos","TrendMicro",
     "McAfee","DrWeb","Fortinet","ClamAV","Paloalto","Malwarebytes","VIPRE"
@@ -79,6 +83,54 @@ def secret_is_valid(token: str) -> bool:
 def gen_token(length: int = 24) -> str:
     alphabet = string.ascii_letters + string.digits + "_-"
     return "".join(random.choice(alphabet) for _ in range(length))
+
+# ----- Username history helpers -----
+def _fmt_username(u: str | None) -> str:
+    return f"@{u}" if u else "-"
+
+def load_username_history():
+    global USERNAME_HISTORY
+    try:
+        with open(HIST_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            USERNAME_HISTORY = {str(k): list(v) for k, v in data.items()}
+        logger.info(f"Loaded username history entries: {len(USERNAME_HISTORY)}")
+    except Exception:
+        USERNAME_HISTORY = {}
+        logger.info("No existing username history file; starting fresh.")
+
+def save_username_history():
+    try:
+        with open(HIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(USERNAME_HISTORY, f, ensure_ascii=False)
+    except Exception as e:
+        logger.debug(f"save_username_history failed: {e}")
+
+def username_history_line(user_id: int, current_username: str | None) -> str:
+    """
+    Update the username history for this user and return a formatted line for alerts.
+    If the username changed, show the full history chain: old1 → old2 → ... → current (N changes).
+    """
+    uid = str(user_id)
+    history = USERNAME_HISTORY.get(uid)
+
+    if not history:
+        USERNAME_HISTORY[uid] = [current_username]
+        save_username_history()
+        return f"• username: {_fmt_username(current_username)}"
+
+    last = history[-1]
+    if last != current_username:
+        history.append(current_username)
+        USERNAME_HISTORY[uid] = history
+        save_username_history()
+        chain = " → ".join(_fmt_username(u) for u in history)
+        changes = max(0, len(history) - 1)
+        note = f" ({changes} changes)"
+        return f"• username changed: {chain}{note}"
+
+    # unchanged
+    return f"• username: {_fmt_username(current_username)}"
 
 # ------------- Helpers (async) -------------
 async def delete_message_safe(update: Update, context):
@@ -358,6 +410,12 @@ async def moderate(update: Update, context):
     chat_id = update.effective_chat.id
     text = (msg.text or msg.caption or "")
 
+    # Opportunistically track username on any message
+    try:
+        _ = username_history_line(user.id, user.username)
+    except Exception:
+        pass
+
     if is_admin(user.id): return
 
     if record_user_message(chat_id, user.id) > FLOOD_MAX_MSG:
@@ -399,12 +457,12 @@ async def welcome_verify(update: Update, context):
         keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify:{new_member.id}:{int(n==correct)}")] for n in options]
         PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct, "mode": "post", "token": None}
 
-        # Group alert with basic details
+        # Details
         uid = new_member.id
         isbot = "true" if new_member.is_bot else "false"
         fn = new_member.first_name or "-"
         ln = new_member.last_name or "-"
-        un = new_member.username or "-"
+        username_line = username_history_line(uid, new_member.username)
         link = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
         lang = getattr(new_member, "language_code", None) or "-"
 
@@ -412,16 +470,17 @@ async def welcome_verify(update: Update, context):
             "📣 NEW MEMBER ALERT\n"
             f"• Group: {chat_title} ({chat_id})\n"
             f"• UID: {uid}\n• is_bot: {isbot}\n• first_name: {fn}\n• last_name: {ln}\n"
-            f"• username: {un} {link}\n• language_code: {lang}\n\n"
+            f"{username_line} {link}\n• language_code: {lang}\n\n"
             f"Please verify: pick **{correct}** to unlock chatting.\nUID: `{new_member.id}`"
         )
         await context.bot.send_message(chat_id, alert_group, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-        # Admin DM alert
         alert_admin = (
             "🔔 NEW MEMBER JOINED\n"
             f"• Group: {chat_title} ({chat_id})\n"
-            f"• UID: {uid}\n• username: {un}\n• Name: {fn} {ln}\n"
+            f"• UID: {uid}\n"
+            f"{username_line}\n"
+            f"• Name: {fn} {ln}\n"
             "A post‑join CAPTCHA has been posted and the user is currently restricted."
         )
         await notify_admins(context, alert_admin)
@@ -437,9 +496,7 @@ async def handle_join_request(update: Update, context):
     token = gen_token()
     PENDING_JOIN[token] = {"chat_id": chat_id, "user_id": user.id}
 
-    deep_link = None
-    if BOT_USERNAME:
-        deep_link = f"https://t.me/{BOT_USERNAME}?start=join-{token}"
+    deep_link = f"https://t.me/{BOT_USERNAME}?start=join-{token}" if BOT_USERNAME else None
 
     UNVERIFIED.add((chat_id, user.id))
     logger.info(f"JOIN REQUEST: stored token {token} for {(chat_id, user.id)}")
@@ -455,11 +512,14 @@ async def handle_join_request(update: Update, context):
     except Exception as e:
         logger.debug(f"DM to user failed (likely user never started bot): {e}")
 
-    # Admin alert with deep-link (so admins can remind the user)
+    username_line = username_history_line(user.id, user.username)
+
     admin_text = (
         "🔔 NEW JOIN REQUEST\n"
         f"• Group: {chat_title} ({chat_id})\n"
-        f"• UID: {user.id}\n• username: {user.username or '-'}\n• Name: {user.first_name or '-'} {user.last_name or '-'}\n\n"
+        f"• UID: {user.id}\n"
+        f"{username_line}\n"
+        f"• Name: {user.first_name or '-'} {user.last_name or '-'}\n\n"
         "Pre‑join verification required. If the user cannot receive DMs, ask them to start the bot and click:\n"
         f"{deep_link or '(bot username not yet known; user should open the bot and send /start join-'+token+')'}"
     )
@@ -736,6 +796,9 @@ async def main():
         logger.info(f"BOT_USERNAME resolved: {BOT_USERNAME}")
     except Exception as e:
         logger.warning(f"Failed to resolve BOT_USERNAME: {e}")
+
+    # Load username history after bot is ready
+    load_username_history()
 
     # set webhook (non-fatal on error)
     try:
