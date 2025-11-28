@@ -1,6 +1,6 @@
 
 #!/usr/bin/env python
-import os, re, sys, random, logging, asyncio
+import os, re, sys, random, logging, asyncio, string
 from datetime import datetime, timedelta
 
 # Optional dependency for VirusTotal
@@ -9,7 +9,9 @@ try:
 except ImportError:
     requests = None
 
-from telegram import Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+from telegram import (
+    Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
+)
 from telegram.helpers import escape_markdown
 import telegram
 
@@ -18,40 +20,42 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-# ---------------- Logging ----------------
+# ------------- Logging -------------
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("safeguard-bot")
 
-# ---------------- Environment ----------------
-BOT_TOKEN       = os.getenv("BOT_TOKEN", "")
-ADMIN_IDS       = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-WEBHOOK_SECRET  = os.getenv("WEBHOOK_SECRET", "change-me")
-BASE_URL        = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
-WEBHOOK_PATH    = "/webhook"
-WEBHOOK_URL     = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
-VT_API_KEY      = os.getenv("VT_API_KEY", "")
+# ------------- Environment -------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+WEBHOOK_PATH = "/webhook"
+WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
+VT_API_KEY = os.getenv("VT_API_KEY", "")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
 
 # VirusTotal API
-VT_FILE_SCAN_URL     = "https://www.virustotal.com/api/v3/files"
-VT_ANALYSES_URL_TPL  = "https://www.virustotal.com/api/v3/analyses/{}"
-VT_HEADERS           = {"x-apikey": VT_API_KEY}
+VT_FILE_SCAN_URL = "https://www.virustotal.com/api/v3/files"
+VT_ANALYSES_URL_TPL = "https://www.virustotal.com/api/v3/analyses/{}"
+VT_HEADERS = {"x-apikey": VT_API_KEY}
 
 # Policies
-BAD_WORDS        = {"idiot", "stupid", "fool"}
-BLOCK_LINKS      = True
-WARN_LIMIT       = 2
-FLOOD_MAX_MSG    = 5
+BAD_WORDS = {"idiot", "stupid", "fool"}
+BLOCK_LINKS = True
+WARN_LIMIT = 2
+FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
-MUTE_SECONDS     = 60
+MUTE_SECONDS = 60
 
 # State
-PENDING_CAPTCHA   = {}     # user_id -> {"chat_id": ..., "answer": ...}
-USER_WARNINGS     = {}     # (chat_id, user_id) -> count
-USER_MSG_TIMES    = {}     # (chat_id, user_id) -> timestamps
-UNVERIFIED        = set()  # {(chat_id, user_id)}
+PENDING_CAPTCHA = {}   # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
+PENDING_JOIN = {}      # token -> {"chat_id": ..., "user_id": ...}
+USER_WARNINGS = {}     # (chat_id, user_id) -> count
+USER_MSG_TIMES = {}    # (chat_id, user_id) -> timestamps
+UNVERIFIED = set()     # {(chat_id, user_id)}
+BOT_USERNAME = None    # filled at startup
 
 ENGINES_FOR_PROGRESS = [
     "Kaspersky","Avast","BitDefender","ESET-NOD32","Microsoft","Sophos","TrendMicro",
@@ -61,14 +65,22 @@ ENGINES_FOR_PROGRESS = [
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)", re.IGNORECASE)
+URL_REGEX = re.compile(
+    r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)",
+    re.IGNORECASE
+)
+
 def contains_link(text: str) -> bool:
     return bool(URL_REGEX.search(text or ""))
 
 def secret_is_valid(token: str) -> bool:
     return bool(re.match(r'^[A-Za-z0-9_\-]{1,256}$', token))
 
-# ---------------- Helpers (async) ----------------
+def gen_token(length: int = 24) -> str:
+    alphabet = string.ascii_letters + string.digits + "_-"
+    return "".join(random.choice(alphabet) for _ in range(length))
+
+# ------------- Helpers (async) -------------
 async def delete_message_safe(update: Update, context):
     try:
         await context.bot.delete_message(update.effective_chat.id, update.effective_message.message_id)
@@ -107,7 +119,14 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     USER_MSG_TIMES[key] = [t for t in times if now - t <= FLOOD_WINDOW_SEC]
     return len(USER_MSG_TIMES[key])
 
-# ---------------- Diagnostics ----------------
+async def notify_admins(context, text: str, parse_mode=None):
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, text, parse_mode=parse_mode)
+        except Exception as e:
+            logger.debug(f"notify_admins failed for {admin_id}: {e}")
+
+# ------------- Diagnostics -------------
 async def log_all_updates(update: Update, context):
     types = []
     if update.message: types.append("message")
@@ -126,18 +145,60 @@ async def log_all_updates(update: Update, context):
     if update.chat_join_request: types.append("chat_join_request")
     logger.info(f"UPDATE TYPES: {types}")
 
-# ---------------- Commands ----------------
+# ------------- Commands -------------
 async def cmd_start(update: Update, context):
     logger.info(f"[HANDLER] /start fired in chat_id={update.effective_chat.id}")
+
+    # Handle deep-link payloads for pre-join verification: /start join-<token>
+    payload = None
+    if update.message and update.message.text:
+        parts = update.message.text.strip().split(maxsplit=1)
+        if len(parts) == 2 and parts[0] == "/start":
+            payload = parts[1].strip()
+
+    if payload and payload.startswith("join-"):
+        token = payload.split("join-", 1)[1].strip()
+        pending = PENDING_JOIN.get(token)
+        if not pending:
+            await context.bot.send_message(
+                chat_id=update.effective_chat.id,
+                text="⚠️ Verification link is invalid or expired. Please request to join again."
+            )
+            return
+
+        # Issue a private CAPTCHA
+        correct = random.randint(1, 4)
+        options = list(range(1, 5)); random.shuffle(options)
+        keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify_join:{token}:{int(n==correct)}")] for n in options]
+
+        # Track pending per user
+        PENDING_CAPTCHA[update.effective_user.id] = {
+            "chat_id": pending["chat_id"],
+            "answer": correct,
+            "mode": "pre",
+            "token": token
+        }
+
+        await context.bot.send_message(
+            chat_id=update.effective_chat.id,
+            text="🔐 Please solve the CAPTCHA to join the group. Pick the correct number:",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    # Default intro
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=("Hello! I keep this group safe—moderation, anti-spam, and new member verification.\n"
-              "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins.\n\n"
-              "You can also send a file or photo and I’ll **scan it with VirusTotal** to check for malware.")
+        text=(
+            "Hello! I keep this group safe—moderation, anti‑spam, and new member verification.\n"
+            "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins.\n\n"
+            "You can also send a file or photo and I’ll **scan it with VirusTotal** to check for malware."
+        )
     )
 
 async def cmd_rules(update: Update, context):
-    await context.bot.send_message(update.effective_chat.id,
+    await context.bot.send_message(
+        update.effective_chat.id,
         "Group rules:\n• Be respectful.\n• No profanity or harassment.\n• Avoid spam & unsolicited ads.\n"
         "• External links only when relevant.\n• Follow lecturer’s guidance."
     )
@@ -147,7 +208,8 @@ async def cmd_report(update: Update, context):
     await context.bot.send_message(update.effective_chat.id, "Thanks—we have notified the admins.")
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(admin_id,
+            await context.bot.send_message(
+                admin_id,
                 f"[REPORT] Chat {update.effective_chat.id} from @{update.effective_user.username or update.effective_user.id}: {reason}"
             )
         except Exception:
@@ -174,19 +236,20 @@ async def cmd_function(update: Update, context):
         "• Flood control: mute users who send too many messages too fast\n"
         "• Delete violating messages\n\n"
         "**Verification (Group)**\n"
-        "• New members must pass a simple CAPTCHA to chat (permanent gate until verified)\n"
-        "• Instant alert with user details when someone joins (UID shown)\n\n"
+        "• Pre‑join: CAPTCHA via Join Requests; auto‑approval on success\n"
+        "• Post‑join: new members must pass a simple CAPTCHA to chat\n"
+        "• Instant admin alert with user details when someone joins or requests to join\n\n"
         "**Admin Controls**\n"
         "• /addbadword <word ...> – Add banned words (admins only)\n"
         "• /removebadword <word ...> – Remove banned words (admins only)\n"
         "• /togglelinks – Enable/disable link blocking (admins only)\n\n"
         "**Security Scanner**\n"
         "• Send a **file** or **photo** to automatically scan with **VirusTotal** and get a readable summary.\n"
-        "  (Public API has rate limits; use wisely.)"
+        " (Public API has rate limits; use wisely.)"
     )
     await context.bot.send_message(update.effective_chat.id, text, parse_mode="Markdown")
 
-# ---------------- Admin policy controls ----------------
+# ------------- Admin policy controls -------------
 async def enforce_admin_violation(update: Update, context, action_label: str):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -235,11 +298,11 @@ async def togglelinks(update: Update, context):
     BLOCK_LINKS = not BLOCK_LINKS
     await context.bot.send_message(update.effective_chat.id, f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
 
-# ---------------- Gate ----------------
+# ------------- Gate -------------
 async def gate_unverified(update: Update, context):
     chat = update.effective_chat
     user = update.effective_user
-    msg  = update.effective_message
+    msg = update.effective_message
     is_start_cmd = bool(msg and msg.text and msg.text.strip().startswith("/start"))
     if chat.type in ("group", "supergroup") and (chat.id, user.id) in UNVERIFIED and not is_start_cmd:
         await delete_message_safe(update, context)
@@ -248,12 +311,13 @@ async def gate_unverified(update: Update, context):
         except Exception:
             pass
 
-# ---------------- Moderation ----------------
+# ------------- Moderation -------------
 async def moderate(update: Update, context):
-    msg     = update.effective_message
-    user    = msg.from_user
+    msg = update.effective_message
+    user = msg.from_user
     chat_id = update.effective_chat.id
-    text    = (msg.text or msg.caption or "")
+    text = (msg.text or msg.caption or "")
+
     if is_admin(user.id): return
 
     if record_user_message(chat_id, user.id) > FLOOD_MAX_MSG:
@@ -279,46 +343,94 @@ async def moderate(update: Update, context):
         if total >= WARN_LIMIT:
             await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
 
-# ---------------- Join alert + CAPTCHA ----------------
+# ------------- Join alert + CAPTCHA (Post-join) -------------
 async def welcome_verify(update: Update, context):
     chat_id = update.effective_chat.id
+    chat_title = update.effective_chat.title or str(chat_id)
+
     for new_member in update.message.new_chat_members:
         UNVERIFIED.add((chat_id, new_member.id))
         await restrict_user(chat_id, new_member.id, context, until_date=None)
 
+        # Build in-group CAPTCHA
         correct = random.randint(1, 4)
         options = list(range(1, 5)); random.shuffle(options)
         keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify:{new_member.id}:{int(n==correct)}")] for n in options]
-        PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct}
+        PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct, "mode": "post", "token": None}
 
-        uid   = new_member.id
+        # Group alert with basic details
+        uid = new_member.id
         isbot = "true" if new_member.is_bot else "false"
-        fn    = new_member.first_name or "-"
-        ln    = new_member.last_name or "-"
-        un    = new_member.username or "-"
-        link  = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
-        lang  = getattr(new_member, "language_code", None) or "-"
+        fn = new_member.first_name or "-"
+        ln = new_member.last_name or "-"
+        un = new_member.username or "-"
+        link = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
+        lang = getattr(new_member, "language_code", None) or "-"
 
-        alert = (
+        alert_group = (
             "📣 NEW MEMBER ALERT\n"
+            f"• Group: {chat_title} ({chat_id})\n"
             f"• UID: {uid}\n• is_bot: {isbot}\n• first_name: {fn}\n• last_name: {ln}\n"
             f"• username: {un} {link}\n• language_code: {lang}\n\n"
             f"Please verify: pick **{correct}** to unlock chatting.\nUID: `{new_member.id}`"
         )
-        await context.bot.send_message(chat_id, alert, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+        await context.bot.send_message(chat_id, alert_group, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
+        # Admin DM alert
+        alert_admin = (
+            "🔔 NEW MEMBER JOINED\n"
+            f"• Group: {chat_title} ({chat_id})\n"
+            f"• UID: {uid}\n• username: {un}\n• Name: {fn} {ln}\n"
+            "A post‑join CAPTCHA has been posted and the user is currently restricted."
+        )
+        await notify_admins(context, alert_admin)
+
+# ------------- Join Request (Pre-join verification) -------------
 async def handle_join_request(update: Update, context):
     req = update.chat_join_request
-    UNVERIFIED.add((req.chat.id, req.from_user.id))
-    logger.info(f"JOIN REQUEST: marked UNVERIFIED {(req.chat.id, req.from_user.id)}")
+    chat_id = req.chat.id
+    chat_title = req.chat.title or str(chat_id)
+    user = req.from_user
 
-# ---------------- VirusTotal scanning ----------------
+    # Create one-time token + deep-link for verification
+    token = gen_token()
+    PENDING_JOIN[token] = {"chat_id": chat_id, "user_id": user.id}
+
+    deep_link = None
+    # We’ll fill BOT_USERNAME at startup; use a safe fallback if missing
+    if BOT_USERNAME:
+        deep_link = f"https://t.me/{BOT_USERNAME}?start=join-{token}"
+
+    UNVERIFIED.add((chat_id, user.id))
+    logger.info(f"JOIN REQUEST: stored token {token} for {(chat_id, user.id)}")
+
+    # Try DM the user (may fail if user hasn’t started the bot)
+    dm_text = (
+        "👋 You requested to join the group.\n"
+        "Please complete the CAPTCHA to get approved.\n\n"
+        f"➡️ Tap this link to start verification: {deep_link or 'Open the bot and send /start join-'+token}"
+    )
+    try:
+        await context.bot.send_message(user.id, dm_text)
+    except Exception as e:
+        logger.debug(f"DM to user failed (likely user never started bot): {e}")
+
+    # Admin alert with deep-link (so admins can remind the user)
+    admin_text = (
+        "🔔 NEW JOIN REQUEST\n"
+        f"• Group: {chat_title} ({chat_id})\n"
+        f"• UID: {user.id}\n• username: {user.username or '-'}\n• Name: {user.first_name or '-'} {user.last_name or '-'}\n\n"
+        "Pre‑join verification required. If the user cannot receive DMs, ask them to start the bot and click:\n"
+        f"{deep_link or '(bot username not yet known; user should open the bot and send /start join-'+token+')'}"
+    )
+    await notify_admins(context, admin_text)
+
+# ------------- VirusTotal scanning -------------
 async def vt_scan_and_report(file_path: str, progress_msg):
     if requests is None:
         await progress_msg.edit_text("❌ 'requests' not installed. Add it to requirements.txt and redeploy."); return
     if not VT_API_KEY:
         await progress_msg.edit_text("❌ VirusTotal API key (VT_API_KEY) not configured."); return
-
     try:
         with open(file_path, "rb") as f:
             resp = requests.post(VT_FILE_SCAN_URL, headers=VT_HEADERS, files={"file": f})
@@ -326,7 +438,7 @@ async def vt_scan_and_report(file_path: str, progress_msg):
             analysis_id = resp.json().get("data", {}).get("id")
             if not analysis_id:
                 await progress_msg.edit_text("❌ Failed to get analysis ID from VirusTotal."); return
-        await progress_msg.edit_text("✅ File uploaded! Scanning in progress...")
+            await progress_msg.edit_text("✅ File uploaded! Scanning in progress...")
     except Exception as e:
         await progress_msg.edit_text(f"❌ Upload error: {escape_markdown(str(e), version=2)}", parse_mode="MarkdownV2"); return
 
@@ -338,21 +450,19 @@ async def vt_scan_and_report(file_path: str, progress_msg):
             s.raise_for_status()
             attrs = s.json().get("data", {}).get("attributes", {})
             if attrs.get("status") == "completed":
-                stats   = attrs.get("stats", {})
+                stats = attrs.get("stats", {})
                 results = attrs.get("results", {})
                 malicious, suspicious, clean = [], [], []
                 for engine, det in results.items():
                     cat = det.get("category"); res = det.get("result")
-                    if cat == "malicious":   malicious.append(f"• {engine}: {res}")
+                    if cat == "malicious": malicious.append(f"• {engine}: {res}")
                     elif cat == "suspicious": suspicious.append(f"• {engine}: {res or 'Suspicious'}")
-                    else:                    clean.append(f"• {engine}: clean")
-
+                    else: clean.append(f"• {engine}: clean")
                 grouped = "──────────────\n"
                 if malicious: grouped += "🔴 *Malicious:*\n" + "\n".join(malicious) + "\n\n"
                 if suspicious: grouped += "🟠 *Suspicious:*\n" + "\n".join(suspicious) + "\n\n"
-                if clean:     grouped += "✅ *Clean:*\n" + "\n".join(clean) + "\n"
+                if clean: grouped += "✅ *Clean:*\n" + "\n".join(clean) + "\n"
                 grouped += "──────────────"
-
                 summary = (
                     f"✅ **Scan Complete!**\n\n"
                     f"🔎 **Summary:**\n"
@@ -394,31 +504,64 @@ async def scan_photo(update: Update, context):
     progress = await context.bot.send_message(update.effective_chat.id, "⏳ Uploading image to VirusTotal and starting scan...")
     await vt_scan_and_report(path, progress)
 
-# ---------------- Verify button ----------------
+# ------------- Verify button (both modes) -------------
 async def verify_callback(update: Update, context):
     q = update.callback_query; await q.answer()
     try:
-        _, uid_str, ok_str = q.data.split(":")
-        user_id = int(uid_str); is_ok = bool(int(ok_str))
-        pending = PENDING_CAPTCHA.get(user_id)
-        if not pending: await q.edit_message_text("No active verification."); return
-        chat_id = pending["chat_id"]
-        if q.from_user.id != user_id:
-            await q.edit_message_text("This verification is not for you."); return
-        if is_ok:
-            await unrestrict_user(chat_id, user_id, context)
-            UNVERIFIED.discard((chat_id, user_id))
-            await q.edit_message_text("✅ Verified. Welcome!")
-            PENDING_CAPTCHA.pop(user_id, None)
-        else:
-            await q.edit_message_text("❌ Wrong answer. Try again.")
+        if q.data.startswith("verify:"):
+            # Post-join in-group verification
+            _, uid_str, ok_str = q.data.split(":")
+            user_id = int(uid_str); is_ok = bool(int(ok_str))
+            pending = PENDING_CAPTCHA.get(user_id)
+            if not pending:
+                await q.edit_message_text("No active verification."); return
+            chat_id = pending["chat_id"]
+            if q.from_user.id != user_id:
+                await q.edit_message_text("This verification is not for you."); return
+            if is_ok:
+                await unrestrict_user(chat_id, user_id, context)
+                UNVERIFIED.discard((chat_id, user_id))
+                await q.edit_message_text("✅ Verified. Welcome!")
+                PENDING_CAPTCHA.pop(user_id, None)
+            else:
+                await q.edit_message_text("❌ Wrong answer. Try again.")
+
+        elif q.data.startswith("verify_join:"):
+            # Pre-join private verification
+            _, token, ok_str = q.data.split(":")
+            is_ok = bool(int(ok_str))
+            pending_join = PENDING_JOIN.get(token)
+            if not pending_join:
+                await q.edit_message_text("Verification expired. Please request to join again."); return
+            chat_id = pending_join["chat_id"]
+            user_id = pending_join["user_id"]
+            if q.from_user.id != user_id:
+                await q.edit_message_text("This verification is not for you."); return
+
+            if is_ok:
+                try:
+                    await context.bot.approve_chat_join_request(chat_id, user_id)
+                    UNVERIFIED.discard((chat_id, user_id))
+                except Exception as e:
+                    logger.warning(f"approve_chat_join_request failed: {e}")
+                await q.edit_message_text("✅ Verified. Your join request has been approved. Welcome!")
+                PENDING_JOIN.pop(token, None)
+                PENDING_CAPTCHA.pop(user_id, None)
+            else:
+                # Re-issue the same keyboard to retry
+                correct = PENDING_CAPTCHA.get(user_id, {}).get("answer", random.randint(1, 4))
+                options = list(range(1, 5)); random.shuffle(options)
+                keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify_join:{token}:{int(n==correct)}")] for n in options]
+                # Update stored answer
+                PENDING_CAPTCHA[user_id] = {"chat_id": chat_id, "answer": correct, "mode": "pre", "token": token}
+                await q.edit_message_text("❌ Wrong answer. Try again:", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
         logger.debug(f"verify_callback error: {e}")
 
-# ---------------- PTB + Starlette ----------------
+# ------------- PTB + Starlette -------------
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
-    ChatMemberHandler, ChatJoinRequestHandler, filters, AIORateLimiter, Defaults
+    ChatJoinRequestHandler, filters, AIORateLimiter, Defaults
 )
 from telegram.constants import MessageEntityType
 
@@ -430,8 +573,8 @@ logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
 builder = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
-    .updater(None)                   # custom webhook pattern
-    .defaults(Defaults(block=False)) # non-blocking handlers
+    .updater(None)     # custom webhook pattern
+    .defaults(Defaults(block=False))  # non-blocking handlers
 )
 try:
     builder = builder.rate_limiter(AIORateLimiter())
@@ -440,54 +583,63 @@ except Exception as e:
 
 application = builder.build()
 bot_for_update = application.bot
-BOT_USERNAME = None
 
 # Global error logger
 async def on_error(update: object, context):
     logger.error("Handler error", exc_info=context.error)
+
 application.add_error_handler(on_error)
 
-# ---- Handler registrations (AFTER functions) ----
+# ----- Handler registrations (AFTER functions) -----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
-
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
 
-application.add_handler(CommandHandler("start",     cmd_start,     block=False), group=1)
-application.add_handler(CommandHandler("rules",     cmd_rules,     block=False), group=1)
-application.add_handler(CommandHandler("report",    cmd_report,    block=False), group=1)
-application.add_handler(CommandHandler("warnings",  cmd_warnings,  block=False), group=1)
-application.add_handler(CommandHandler("function",  cmd_function,  block=False), group=1)
-application.add_handler(CommandHandler("ping",      cmd_ping,      block=False), group=1)
-application.add_handler(CommandHandler("addbadword",    addbadword,    block=False), group=1)
+application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
+application.add_handler(CommandHandler("rules", cmd_rules, block=False), group=1)
+application.add_handler(CommandHandler("report", cmd_report, block=False), group=1)
+application.add_handler(CommandHandler("warnings", cmd_warnings, block=False), group=1)
+application.add_handler(CommandHandler("function", cmd_function, block=False), group=1)
+application.add_handler(CommandHandler("ping", cmd_ping, block=False), group=1)
+application.add_handler(CommandHandler("addbadword", addbadword, block=False), group=1)
 application.add_handler(CommandHandler("removebadword", removebadword, block=False), group=1)
-application.add_handler(CommandHandler("togglelinks",   togglelinks,   block=False), group=1)
+application.add_handler(CommandHandler("togglelinks", togglelinks, block=False), group=1)
 
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)
-application.add_handler(MessageHandler(filters.PHOTO,         scan_photo,    block=False), group=1)
+application.add_handler(MessageHandler(filters.PHOTO, scan_photo, block=False), group=1)
 
+# Post-join flow
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify), group=1)
+
+# Pre-join flow
 application.add_handler(ChatJoinRequestHandler(handle_join_request), group=1)
 
-application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^verify:"), group=1)
+# Unified verification callback
+application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^(verify:|verify_join:)"), group=1)
 
+# Moderation
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate), group=1)
 
-# ---- Command tap (optional log) ----
+# ----- Command tap (optional log) -----
 async def group_command_tap(update: Update, context):
-    msg = update.message; txt = msg.text or ""; ents = msg.entities or []; target = None
+    msg = update.message; txt = msg.text or ""; ents = msg.entities or []
+    target = None
     for e in ents:
         if e.type == MessageEntityType.BOT_COMMAND:
-            cmd = txt[e.offset:e.offset + e.length]; target = cmd.split('@', 1)[1] if '@' in cmd else None; break
+            cmd = txt[e.offset:e.offset + e.length]
+            target = cmd.split('@', 1)[1] if '@' in cmd else None
+            break
     try:
         me = await context.bot.get_me()
         cm = await context.bot.get_chat_member(update.effective_chat.id, me.id)
         logger.info(f"GROUP COMMAND SEEN: text={txt!r}, target={target!r}, chat_id={update.effective_chat.id}, bot_status={cm.status}")
     except Exception as e:
         logger.debug(f"get_chat_member failed: {e}")
+
 application.add_handler(MessageHandler(filters.COMMAND & group_chats_filter_v20, group_command_tap), group=2)
 
-# ---- Commands menu ----
+# ----- Commands menu -----
 async def set_my_commands():
     try:
         cmds = [
@@ -502,9 +654,9 @@ async def set_my_commands():
     except Exception as e:
         logger.debug(f"set_my_commands failed: {e}")
 
-# ---- Starlette app & webhook ----
+# ----- Starlette app & webhook -----
 async def healthz(request: Request): return JSONResponse({"status":"ok"})
-async def root(request: Request):   return PlainTextResponse("OK", status_code=200)
+async def root(request: Request): return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request) -> Response:
     # Optional secret header check
@@ -516,12 +668,14 @@ async def webhook(request: Request) -> Response:
     await application.update_queue.put(Update.de_json(data=data, bot=bot_for_update))
     return Response()
 
-routes = [ Route("/", root, methods=["GET"]),
-           Route("/healthz", healthz, methods=["GET"]),
-           Route(WEBHOOK_PATH, webhook, methods=["POST"]) ]
+routes = [
+    Route("/", root, methods=["GET"]),
+    Route("/healthz", healthz, methods=["GET"]),
+    Route(WEBHOOK_PATH, webhook, methods=["POST"])
+]
 app = Starlette(routes=routes)
 
-# ---- Async main: start PTB + Uvicorn and SERVE (blocks) ----
+# ----- Async main: start PTB + Uvicorn and SERVE (blocks) -----
 async def main():
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
@@ -531,6 +685,15 @@ async def main():
 
     await application.initialize()
     await application.start()
+
+    # Resolve bot username for deep-links
+    global BOT_USERNAME
+    try:
+        me = await application.bot.get_me()
+        BOT_USERNAME = me.username
+        logger.info(f"BOT_USERNAME resolved: {BOT_USERNAME}")
+    except Exception as e:
+        logger.warning(f"Failed to resolve BOT_USERNAME: {e}")
 
     # set webhook (non-fatal on error)
     try:
@@ -552,7 +715,7 @@ async def main():
 
     await set_my_commands()
 
-    # BLOCK here; prevents “Application exited early”
+    # BLOCK here
     await server.serve()
 
     # graceful stop
