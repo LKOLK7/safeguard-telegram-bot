@@ -94,6 +94,7 @@ async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
     )
     try:
         await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until_date)
+        logger.info(f"Restricted user {user_id} in chat {chat_id}")
     except Exception as e:
         logger.warning(f"Restrict failed: {e}")
 
@@ -103,6 +104,7 @@ async def unrestrict_user(chat_id: int, user_id: int, context):
     )
     try:
         await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms)
+        logger.info(f"Unrestricted user {user_id} in chat {chat_id}")
     except Exception as e:
         logger.warning(f"Unrestrict failed: {e}")
 
@@ -249,6 +251,24 @@ async def cmd_function(update: Update, context):
     )
     await context.bot.send_message(update.effective_chat.id, text, parse_mode="Markdown")
 
+async def cmd_diagnose(update: Update, context):
+    chat_id = update.effective_chat.id
+    try:
+        me = await context.bot.get_me()
+        cm = await context.bot.get_chat_member(chat_id, me.id)
+        text = [
+            f"Bot username: {me.username}",
+            f"Bot role in this chat: {cm.status}",
+            f"Can delete messages: {getattr(cm, 'can_delete_messages', False)}",
+            f"Can restrict/ban users: {getattr(cm, 'can_restrict_members', False)}",
+            f"Webhook URL: {WEBHOOK_URL or '(empty)'}",
+            f"WEBHOOK_SECRET enabled: {bool(WEBHOOK_SECRET)}",
+            f"ADMIN_IDS loaded: {sorted(list(ADMIN_IDS))}",
+        ]
+        await context.bot.send_message(chat_id, "\n".join(text))
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"Diagnose error: {e}")
+
 # ------------- Admin policy controls -------------
 async def enforce_admin_violation(update: Update, context, action_label: str):
     user_id = update.effective_user.id
@@ -349,6 +369,7 @@ async def welcome_verify(update: Update, context):
     chat_title = update.effective_chat.title or str(chat_id)
 
     for new_member in update.message.new_chat_members:
+        logger.info(f"NEW_CHAT_MEMBER: {new_member.id} joined chat {chat_id}")
         UNVERIFIED.add((chat_id, new_member.id))
         await restrict_user(chat_id, new_member.id, context, until_date=None)
 
@@ -397,7 +418,6 @@ async def handle_join_request(update: Update, context):
     PENDING_JOIN[token] = {"chat_id": chat_id, "user_id": user.id}
 
     deep_link = None
-    # We’ll fill BOT_USERNAME at startup; use a safe fallback if missing
     if BOT_USERNAME:
         deep_link = f"https://t.me/{BOT_USERNAME}?start=join-{token}"
 
@@ -592,8 +612,8 @@ application.add_error_handler(on_error)
 
 # ----- Handler registrations (AFTER functions) -----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
-group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
 
+group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
 
 application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
@@ -605,6 +625,7 @@ application.add_handler(CommandHandler("ping", cmd_ping, block=False), group=1)
 application.add_handler(CommandHandler("addbadword", addbadword, block=False), group=1)
 application.add_handler(CommandHandler("removebadword", removebadword, block=False), group=1)
 application.add_handler(CommandHandler("togglelinks", togglelinks, block=False), group=1)
+application.add_handler(CommandHandler("diagnose", cmd_diagnose, block=False), group=1)
 
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)
 application.add_handler(MessageHandler(filters.PHOTO, scan_photo, block=False), group=1)
@@ -649,6 +670,7 @@ async def set_my_commands():
             BotCommand("warnings","Show your warnings"),
             BotCommand("function","Show all bot functions"),
             BotCommand("ping","Quick connectivity test"),
+            BotCommand("diagnose","Show bot permissions & config"),
         ]
         await application.bot.set_my_commands(cmds)
     except Exception as e:
