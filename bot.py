@@ -89,8 +89,18 @@ async def delete_message_safe(update: Update, context):
         logger.warning(f"Delete failed: {e}")
 
 async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
+    # PTB >= 20.5: granular fields (no can_send_media_messages)
     perms = ChatPermissions(
-        can_send_messages=False, can_send_media_messages=False, can_send_polls=False, can_add_web_page_previews=False
+        can_send_messages=False,
+        can_send_polls=False,
+        can_send_other_messages=False,
+        can_add_web_page_previews=False,
+        can_send_audios=False,
+        can_send_documents=False,
+        can_send_photos=False,
+        can_send_videos=False,
+        can_send_video_notes=False,
+        can_send_voice_notes=False,
     )
     try:
         await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until_date)
@@ -99,8 +109,18 @@ async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
         logger.warning(f"Restrict failed: {e}")
 
 async def unrestrict_user(chat_id: int, user_id: int, context):
+    # Re-enable typical messaging capabilities
     perms = ChatPermissions(
-        can_send_messages=True, can_send_media_messages=True, can_send_polls=True, can_add_web_page_previews=True
+        can_send_messages=True,
+        can_send_polls=True,
+        can_send_other_messages=True,
+        can_add_web_page_previews=True,
+        can_send_audios=True,
+        can_send_documents=True,
+        can_send_photos=True,
+        can_send_videos=True,
+        can_send_video_notes=True,
+        can_send_voice_notes=True,
     )
     try:
         await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms)
@@ -612,8 +632,8 @@ application.add_error_handler(on_error)
 
 # ----- Handler registrations (AFTER functions) -----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
-
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
 
 application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
