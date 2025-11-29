@@ -1,6 +1,6 @@
 
 #!/usr/bin/env python
-import os, re, sys, random, logging, asyncio, string, json
+import os, re, sys, random, logging, asyncio, string
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -33,6 +33,7 @@ BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
 VT_API_KEY = os.getenv("VT_API_KEY", "")
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
 
@@ -49,7 +50,7 @@ FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
 MUTE_SECONDS = 60
 
-# State
+# State (in-memory only; no persistence)
 PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
 PENDING_JOIN = {}     # token -> {"chat_id": ..., "user_id": ...}
 USER_WARNINGS = {}    # (chat_id, user_id) -> count
@@ -57,9 +58,8 @@ USER_MSG_TIMES = {}   # (chat_id, user_id) -> timestamps
 UNVERIFIED = set()    # {(chat_id, user_id)}
 BOT_USERNAME = None   # filled at startup
 
-# Username history (persistent)
-HIST_FILE = os.getenv("USERNAME_HISTORY_FILE", "username_history.json")
-USERNAME_HISTORY: dict[str, list[Optional[str]]] = {}  # user_id (str) -> [username1, username2, ...] (None allowed)
+# In-memory session username tracking (non-persistent)
+SESSION_USERNAMES: dict[int, Optional[str]] = {}
 
 ENGINES_FOR_PROGRESS = [
     "Kaspersky","Avast","BitDefender","ESET-NOD32","Microsoft","Sophos","TrendMicro",
@@ -85,62 +85,23 @@ def gen_token(length: int = 24) -> str:
     alphabet = string.ascii_letters + string.digits + "_-"
     return "".join(random.choice(alphabet) for _ in range(length))
 
-# ---- Username history helpers ----
+# ---- Username change (session-only) helpers ----
 def _fmt_username(u: Optional[str]) -> str:
     return f"@{u}" if u else "-"
 
-def load_username_history():
-    """Load username history from disk before the bot starts handling updates."""
-    global USERNAME_HISTORY
-    try:
-        with open(HIST_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        # Normalize keys/values
-        USERNAME_HISTORY = {str(k): [v if v not in ("", None) else None for v in vals] for k, vals in data.items()}
-        logger.info(f"Loaded username history entries: {len(USERNAME_HISTORY)}")
-    except Exception:
-        USERNAME_HISTORY = {}
-        logger.info("No existing username history file; starting fresh.")
-
-def save_username_history():
-    try:
-        with open(HIST_FILE, "w", encoding="utf-8") as f:
-            json.dump(USERNAME_HISTORY, f, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-    except Exception as e:
-        logger.debug(f"save_username_history failed: {e}")
-
-def username_history_line(user_id: int, current_username: Optional[str]) -> str:
+def username_change_alert(user_id: int, current_username: Optional[str]) -> str:
     """
-    Update the username history for this user and return a formatted line for alerts.
-    We always use the label '• username changed:' to match Vy's desired format.
-      - If no prior history or unchanged: show an empty value after the colon.
-      - If changed: show the full chain old → ... → current (without change count).
+    Session-only alert line:
+      - If we have a previous username in this runtime and it differs: show '• username changed: @old → @new'
+      - Else: show '• username: @current' (or '-' if none)
     """
-    uid = str(user_id)
-    history = USERNAME_HISTORY.get(uid)
-
-    if not history:
-        # First time seeing this user: start history with current username
-        USERNAME_HISTORY[uid] = [current_username]
-        save_username_history()
-        return "• username changed: "
-
-    last = history[-1]
-    if last != current_username:
-        history.append(current_username)
-        USERNAME_HISTORY[uid] = history
-        save_username_history()
-
-    # If we actually have a change (i.e., more than one non-None entry), show the chain
-    non_none = [u for u in history if u is not None]
-    if len(non_none) > 1:
-        chain = " → ".join(_fmt_username(u) for u in history)
-        return f"• username changed: {chain}"
-
-    # Otherwise keep it blank per spec
-    return "• username changed: "
+    last = SESSION_USERNAMES.get(user_id)
+    SESSION_USERNAMES[user_id] = current_username  # update for future comparisons
+    if last and last != current_username:
+        old = _fmt_username(last)
+        new = _fmt_username(current_username)
+        return f"• username changed: {old} → {new}"
+    return f"• username: {_fmt_username(current_username)}"
 
 # -------- Helpers (async) --------
 async def delete_message_safe(update: Update, context):
@@ -151,7 +112,7 @@ async def delete_message_safe(update: Update, context):
         logger.warning(f"Delete failed: {e}")
 
 async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
-    # PTB >= 20.5: granular fields (no can_send_media_messages)
+    # PTB >= 20.5: granular fields
     perms = ChatPermissions(
         can_send_messages=False,
         can_send_polls=False,
@@ -298,8 +259,34 @@ async def cmd_warnings(update: Update, context):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
     await context.bot.send_message(update.effective_chat.id, f"Your current warnings: {count}")
 
+# --- Admin-only commands: /ping & /diagnose ---
 async def cmd_ping(update: Update, context):
+    if not is_admin(update.effective_user.id):
+        # Warn normal users for using admin-only command
+        await enforce_admin_violation(update, context, "use admin-only commands (/ping)")
+        return
     await context.bot.send_message(update.effective_chat.id, "🏓 pong")
+
+async def cmd_diagnose(update: Update, context):
+    if not is_admin(update.effective_user.id):
+        await enforce_admin_violation(update, context, "use admin-only commands (/diagnose)")
+        return
+    chat_id = update.effective_chat.id
+    try:
+        me = await context.bot.get_me()
+        cm = await context.bot.get_chat_member(chat_id, me.id)
+        text = [
+            f"Bot username: {me.username}",
+            f"Bot role in this chat: {cm.status}",
+            f"Can delete messages: {getattr(cm, 'can_delete_messages', False)}",
+            f"Can restrict/ban users: {getattr(cm, 'can_restrict_members', False)}",
+            f"Webhook URL: {WEBHOOK_URL or '(empty)'}",
+            f"WEBHOOK_SECRET enabled: {bool(WEBHOOK_SECRET)}",
+            f"ADMIN_IDS loaded: {sorted(list(ADMIN_IDS))}",
+        ]
+        await context.bot.send_message(chat_id, "\n".join(text))
+    except Exception as e:
+        await context.bot.send_message(chat_id, f"Diagnose error: {e}")
 
 async def cmd_function(update: Update, context):
     text = (
@@ -321,30 +308,14 @@ async def cmd_function(update: Update, context):
         "**Admin Controls**\n"
         "• /addbadword <word ...> – Add banned words (admins only)\n"
         "• /removebadword <word ...> – Remove banned words (admins only)\n"
-        "• /togglelinks – Enable/disable link blocking (admins only)\n\n"
+        "• /togglelinks – Enable/disable link blocking (admins only)\n"
+        "• /ping – Quick connectivity test (admins only)\n"
+        "• /diagnose – Show bot permissions & config (admins only)\n\n"
         "**Security Scanner**\n"
         "• Send a **file** or **photo** to automatically scan with **VirusTotal** and get a readable summary.\n"
         "  (Public API has rate limits; use wisely.)"
     )
     await context.bot.send_message(update.effective_chat.id, text, parse_mode="Markdown")
-
-async def cmd_diagnose(update: Update, context):
-    chat_id = update.effective_chat.id
-    try:
-        me = await context.bot.get_me()
-        cm = await context.bot.get_chat_member(chat_id, me.id)
-        text = [
-            f"Bot username: {me.username}",
-            f"Bot role in this chat: {cm.status}",
-            f"Can delete messages: {getattr(cm, 'can_delete_messages', False)}",
-            f"Can restrict/ban users: {getattr(cm, 'can_restrict_members', False)}",
-            f"Webhook URL: {WEBHOOK_URL or '(empty)'}",
-            f"WEBHOOK_SECRET enabled: {bool(WEBHOOK_SECRET)}",
-            f"ADMIN_IDS loaded: {sorted(list(ADMIN_IDS))}",
-        ]
-        await context.bot.send_message(chat_id, "\n".join(text))
-    except Exception as e:
-        await context.bot.send_message(chat_id, f"Diagnose error: {e}")
 
 # -------- Admin policy controls --------
 async def enforce_admin_violation(update: Update, context, action_label: str):
@@ -415,9 +386,9 @@ async def moderate(update: Update, context):
     chat_id = update.effective_chat.id
     text = (msg.text or msg.caption or "")
 
-    # Opportunistically track username on any message
+    # Opportunistically track username on any message (session-only)
     try:
-        _ = username_history_line(user.id, user.username)
+        SESSION_USERNAMES[user.id] = user.username
     except Exception:
         pass
 
@@ -466,7 +437,8 @@ async def welcome_verify(update: Update, context):
         isbot = "true" if new_member.is_bot else "false"
         fn = new_member.first_name or "-"
         ln = new_member.last_name or "-"
-        username_line = username_history_line(uid, new_member.username)
+        # Session-only username alert line
+        username_line = username_change_alert(uid, new_member.username)
         link = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
         lang = getattr(new_member, "language_code", None) or "-"
 
@@ -479,6 +451,7 @@ async def welcome_verify(update: Update, context):
         )
         await context.bot.send_message(chat_id, alert_group, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
+        # Admin alert (same username line)
         alert_admin = (
             "🔔 NEW MEMBER JOINED\n"
             f"• Group: {chat_title} ({chat_id})\n"
@@ -514,7 +487,11 @@ async def handle_join_request(update: Update, context):
     except Exception as e:
         logger.debug(f"DM to user failed (likely user never started bot): {e}")
 
-    username_line = username_history_line(user.id, user.username)
+    # Record current username for session tracking
+    SESSION_USERNAMES[user.id] = user.username
+
+    # Admin alert with session-only username line
+    username_line = username_change_alert(user.id, user.username)
     admin_text = (
         "🔔 NEW JOIN REQUEST\n"
         f"• Group: {chat_title} ({chat_id})\n"
@@ -624,7 +601,9 @@ async def verify_callback(update: Update, context):
             if is_ok:
                 await unrestrict_user(chat_id, user_id, context)
                 UNVERIFIED.discard((chat_id, user_id))
-                await q.edit_message_text("✅ Verified. Welcome!")
+                # Welcome with name
+                name = f"{q.from_user.first_name or ''} {q.from_user.last_name or ''}".strip() or f"@{q.from_user.username}" if q.from_user.username else str(q.from_user.id)
+                await q.edit_message_text(f"✅ Verified. Welcome {name}")
                 PENDING_CAPTCHA.pop(user_id, None)
             else:
                 await q.edit_message_text("❌ Wrong answer. Try again.")
@@ -645,7 +624,8 @@ async def verify_callback(update: Update, context):
                     UNVERIFIED.discard((chat_id, user_id))
                 except Exception as e:
                     logger.warning(f"approve_chat_join_request failed: {e}")
-                await q.edit_message_text("✅ Verified. Your join request has been approved. Welcome!")
+                name = f"{q.from_user.first_name or ''} {q.from_user.last_name or ''}".strip() or f"@{q.from_user.username}" if q.from_user.username else str(q.from_user.id)
+                await q.edit_message_text(f"✅ Verified. Welcome {name}")
                 PENDING_JOIN.pop(token, None)
                 PENDING_CAPTCHA.pop(user_id, None)
             else:
@@ -696,44 +676,20 @@ application.add_error_handler(on_error)
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
 
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
 
+# Commands
 application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
 application.add_handler(CommandHandler("rules", cmd_rules, block=False), group=1)
 application.add_handler(CommandHandler("report", cmd_report, block=False), group=1)
 application.add_handler(CommandHandler("warnings", cmd_warnings, block=False), group=1)
 application.add_handler(CommandHandler("function", cmd_function, block=False), group=1)
+
+# Admin-only registrations for ping/diagnose (enforced inside handlers)
 application.add_handler(CommandHandler("ping", cmd_ping, block=False), group=1)
-application.add_handler(CommandHandler("addbadword", addbadword, block=False), group=1)
-application.add_handler(CommandHandler("removebadword", removebadword, block=False), group=1)
-application.add_handler(CommandHandler("togglelinks", togglelinks, block=False), group=1)
 application.add_handler(CommandHandler("diagnose", cmd_diagnose, block=False), group=1)
 
-# OPTIONAL admin helper: seed a previous username for testing
-async def cmd_seedusername(update: Update, context):
-    """Usage: /seedusername <uid> <old_username_without_@> — seeds a prior username for that UID."""
-    if not is_admin(update.effective_user.id):
-        await enforce_admin_violation(update, context, "use admin-only commands (/seedusername)")
-        return
-    if not getattr(context, "args", None) or len(context.args) < 2 or not context.args[0].isdigit():
-        await context.bot.send_message(update.effective_chat.id, "Usage: /seedusername <uid> <old_username>")
-        return
-    uid = context.args[0]
-    old = context.args[1].lstrip("@")
-    hist = USERNAME_HISTORY.get(uid, [])
-    if not hist:
-        USERNAME_HISTORY[uid] = [old]
-    else:
-        if hist[-1] != old:
-            hist.append(old)
-            USERNAME_HISTORY[uid] = hist
-    save_username_history()
-    chain = " → ".join(_fmt_username(u) for u in USERNAME_HISTORY.get(uid, [])) or "-"
-    await context.bot.send_message(update.effective_chat.id, f"Seeded history for {uid}:\n{chain}")
-
-application.add_handler(CommandHandler("seedusername", cmd_seedusername, block=False), group=1)
-
+# Files/photos scanning
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)
 application.add_handler(MessageHandler(filters.PHOTO, scan_photo, block=False), group=1)
 
@@ -776,9 +732,8 @@ async def set_my_commands():
             BotCommand("report","Report an issue to admins"),
             BotCommand("warnings","Show your warnings"),
             BotCommand("function","Show all bot functions"),
-            BotCommand("ping","Quick connectivity test"),
-            BotCommand("diagnose","Show bot permissions & config"),
-            BotCommand("seedusername","(Admin) Seed prior username for a UID"),
+            BotCommand("ping","Quick connectivity test (admins only)"),
+            BotCommand("diagnose","Show bot permissions & config (admins only)"),
         ]
         await application.bot.set_my_commands(cmds)
     except Exception as e:
@@ -813,13 +768,7 @@ async def main():
     config = uvicorn.Config(app=app, host="0.0.0.0", port=port, workers=1, log_level="info")
     server = uvicorn.Server(config)
 
-    # Initialize PTB first
     await application.initialize()
-
-    # Load username history BEFORE starting handlers to avoid startup race
-    load_username_history()
-
-    # Start PTB
     await application.start()
 
     # Resolve bot username for deep-links
