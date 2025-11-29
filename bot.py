@@ -148,7 +148,7 @@ def check_virustotal_url(url: str) -> Tuple[bool, str]:
         uid = vt_url_id(url)
         g = requests.get(f"{VT_BASE}/urls/{uid}", headers=headers, timeout=8)
         if g.status_code == 404:
-            p = requests.post(f"{VT_BASE}/urls", headers=headers, data={"url": url}, timeout=8)
+            requests.post(f"{VT_BASE}/urls", headers=headers, data={"url": url}, timeout=8)
             g = requests.get(f"{VT_BASE}/urls/{uid}", headers=headers, timeout=8)
         if g.status_code == 200:
             data = g.json().get("data", {}).get("attributes", {})
@@ -205,12 +205,12 @@ async def analyze_toxicity(text: str) -> Optional[dict]:
     global _last_perspective_call_ts
     if not PERSPECTIVE_API_KEY or requests is None or not text: return None
     now = datetime.now().timestamp()
-    if now - _last_perspective_call_ts < 1.0:  # ~1 QPS
+    if now - _last_perspective_call_ts < PERSPECTIVE_MIN_INTERVAL:  # ~1 QPS
         return None
     _last_perspective_call_ts = now
     payload = {
         "comment": {"text": text[:3000]},
-        "languages": ["en"],  # adjust if needed
+        "languages": ["en"],  # adjust language if needed
         "requestedAttributes": {"TOXICITY": {}, "SEVERE_TOXICITY": {}, "INSULT": {}, "THREAT": {}}
     }
     try:
@@ -370,7 +370,7 @@ async def cmd_start(update: Update, context):
         )
         return
 
-    # NEW: Personalized welcome message in DM
+    # Personalized welcome message in DM
     name = f"{update.effective_user.first_name or ''} {update.effective_user.last_name or ''}".strip() or (
         f"@{update.effective_user.username}" if update.effective_user.username else str(update.effective_user.id)
     )
@@ -447,7 +447,7 @@ async def cmd_function(update: Update, context):
         "**Verification (Group)**\n"
         "• Pre‑join: CAPTCHA via Join Requests; auto‑approval on success\n"
         "• Post‑join: new members must pass a simple CAPTCHA to chat\n"
-        "• Instant admin alert with user details when someone joins or requests to join\n\n"
+        "• Instant admin alert when someone joins or requests to join\n\n"
         "**Admin Controls**\n"
         "• /addbadword <word ...> – Add banned words (admins only)\n"
         "• /removebadword <word ...> – Remove banned words (admins only)\n"
