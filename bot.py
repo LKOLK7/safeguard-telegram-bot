@@ -39,7 +39,6 @@ VT_API_KEY = os.getenv("VT_API_KEY", "")
 GSB_API_KEY = os.getenv("GSB_API_KEY", "")
 PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY", "")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
-# NOTE: PhishTank intentionally excluded per your request (registration disabled)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
@@ -636,7 +635,7 @@ async def welcome_verify(update: Update, context):
         )
         await context.bot.send_message(chat_id, alert_group, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-        # NEW: Post the custom welcome message for new member (with name)
+        # Post the custom welcome message for new member (with name)
         name = f"{new_member.first_name or ''} {new_member.last_name or ''}".strip() or (
             f"@{new_member.username}" if new_member.username else str(new_member.id)
         )
