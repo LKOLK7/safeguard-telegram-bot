@@ -1,10 +1,11 @@
 
 #!/usr/bin/env python
-import os, re, sys, random, logging, asyncio, string
+import os, re, sys, random, logging, asyncio, string, base64, json
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Tuple
+from urllib.parse import urlparse
 
-# Optional dependency for VirusTotal
+# Optional dependency for external APIs
 try:
     import requests
 except ImportError:
@@ -32,15 +33,23 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
+
+# API keys
 VT_API_KEY = os.getenv("VT_API_KEY", "")
+GSB_API_KEY = os.getenv("GSB_API_KEY", "")
+PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY", "")
+ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
+PHISHTANK_APP_KEY = os.getenv("PHISHTANK_APP_KEY", "")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
 
-# VirusTotal API
-VT_FILE_SCAN_URL = "https://www.virustotal.com/api/v3/files"
-VT_ANALYSES_URL_TPL = "https://www.virustotal.com/api/v3/analyses/{}"
-VT_HEADERS = {"x-apikey": VT_API_KEY}
+# ---- API endpoints ----
+VT_BASE = "https://www.virustotal.com/api/v3"
+GSB_LOOKUP = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
+ABUSEIPDB_CHECK = "https://api.abuseipdb.com/api/v2/check"
+PHISHTANK_CHECK = "http://checkurl.phishtank.com/checkurl/"
+PERSPECTIVE_ANALYZE = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
 
 # Policies
 BAD_WORDS = {"idiot", "stupid", "fool"}
@@ -50,16 +59,25 @@ FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
 MUTE_SECONDS = 60
 
-# State (in-memory only; no persistence)
-PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
-PENDING_JOIN = {}     # token -> {"chat_id": ..., "user_id": ...}
-USER_WARNINGS = {}    # (chat_id, user_id) -> count
-USER_MSG_TIMES = {}   # (chat_id, user_id) -> timestamps
-UNVERIFIED = set()    # {(chat_id, user_id)}
-BOT_USERNAME = None   # filled at startup
+# Risk thresholds (tune via env if desired)
+TOXICITY_THRESHOLD = float(os.getenv("TOXICITY_THRESHOLD", "0.85"))
+SEVERE_TOXICITY_THRESHOLD = float(os.getenv("SEVERE_TOXICITY_THRESHOLD", "0.75"))
+INSULT_THRESHOLD = float(os.getenv("INSULT_THRESHOLD", "0.85"))
+THREAT_THRESHOLD = float(os.getenv("THREAT_THRESHOLD", "0.60"))
+ABUSEIPDB_CONFIDENCE_MIN = int(os.getenv("ABUSEIPDB_CONFIDENCE_MIN", "75"))
 
-# In-memory session username tracking (non-persistent)
+# State (in-memory only; no persistence)
+PENDING_CAPTCHA = {}   # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
+PENDING_JOIN = {}      # token -> {"chat_id": ..., "user_id": ...}
+USER_WARNINGS = {}     # (chat_id, user_id) -> count
+USER_MSG_TIMES = {}    # (chat_id, user_id) -> timestamps
+UNVERIFIED = set()     # {(chat_id, user_id)}
+BOT_USERNAME = None    # filled at startup
 SESSION_USERNAMES: dict[int, Optional[str]] = {}
+
+# Simple throttle for Perspective (~1 QPS default)
+_last_perspective_call_ts = 0.0
+PERSPECTIVE_MIN_INTERVAL = float(os.getenv("PERSPECTIVE_MIN_INTERVAL", "1.0"))
 
 ENGINES_FOR_PROGRESS = [
     "Kaspersky","Avast","BitDefender","ESET-NOD32","Microsoft","Sophos","TrendMicro",
@@ -69,11 +87,8 @@ ENGINES_FOR_PROGRESS = [
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# Broad link detector (urls, t.me, telegram.me, @handles)
-URL_REGEX = re.compile(
-    r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)",
-    re.IGNORECASE
-)
+# Link regex (broader)
+URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)", re.IGNORECASE)
 
 def contains_link(text: str) -> bool:
     return bool(URL_REGEX.search(text or ""))
@@ -85,23 +100,148 @@ def gen_token(length: int = 24) -> str:
     alphabet = string.ascii_letters + string.digits + "_-"
     return "".join(random.choice(alphabet) for _ in range(length))
 
-# ---- Username change (session-only) helpers ----
+# ---------- Utilities ----------
+def extract_urls(text: str) -> List[str]:
+    if not text: return []
+    candidates = re.findall(r"https?://\S+|www\.\S+", text, flags=re.IGNORECASE)
+    urls = []
+    for u in candidates:
+        if u.lower().startswith("www."): u = "http://" + u
+        u = u.rstrip(").,;!?'\"")
+        urls.append(u)
+    return urls[:20]
+
+def extract_ips(text: str, urls: List[str]) -> List[str]:
+    ips = []
+    ips += re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text or "")
+    for u in urls:
+        try:
+            host = urlparse(u).hostname
+            if host and re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", host):
+                ips.append(host)
+        except Exception: pass
+    out = []
+    for ip in ips:
+        parts = ip.split(".")
+        if len(parts)==4 and all(p.isdigit() and 0<=int(p)<=255 for p in parts):
+            out.append(ip)
+    return list(dict.fromkeys(out))[:20]
+
 def _fmt_username(u: Optional[str]) -> str:
     return f"@{u}" if u else "-"
 
 def username_change_alert(user_id: int, current_username: Optional[str]) -> str:
-    """
-    Session-only alert line:
-      - If we have a previous username in this runtime and it differs: show '• username changed: @old → @new'
-      - Else: show '• username: @current' (or '-' if none)
-    """
     last = SESSION_USERNAMES.get(user_id)
-    SESSION_USERNAMES[user_id] = current_username  # update for future comparisons
+    SESSION_USERNAMES[user_id] = current_username
     if last and last != current_username:
-        old = _fmt_username(last)
-        new = _fmt_username(current_username)
-        return f"• username changed: {old} → {new}"
+        return f"• username changed: {_fmt_username(last)} → {_fmt_username(current_username)}"
     return f"• username: {_fmt_username(current_username)}"
+
+# ---------- External checks ----------
+def vt_url_id(url: str) -> str:
+    raw = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
+    return raw
+
+def check_virustotal_url(url: str) -> Tuple[bool, str]:
+    if not VT_API_KEY or requests is None: return (False, "VT disabled")
+    headers = {"x-apikey": VT_API_KEY}
+    try:
+        uid = vt_url_id(url)
+        g = requests.get(f"{VT_BASE}/urls/{uid}", headers=headers, timeout=8)
+        if g.status_code == 404:
+            p = requests.post(f"{VT_BASE}/urls", headers=headers, data={"url": url}, timeout=8)
+            g = requests.get(f"{VT_BASE}/urls/{uid}", headers=headers, timeout=8)
+        if g.status_code == 200:
+            data = g.json().get("data", {}).get("attributes", {})
+            verdicts = data.get("last_analysis_stats", {})
+            malicious = int(verdicts.get("malicious", 0))
+            suspicious = int(verdicts.get("suspicious", 0))
+            if malicious > 0 or suspicious > 0:
+                return (True, f"VirusTotal flags: malicious={malicious}, suspicious={suspicious}")
+            return (False, "VirusTotal: clean/undetected")
+        return (False, f"VirusTotal: status={g.status_code}")
+    except Exception as e:
+        return (False, f"VirusTotal error: {e}")
+
+def check_google_safebrowsing(urls: List[str]) -> Tuple[bool, str]:
+    if not GSB_API_KEY or requests is None or not urls: return (False, "GSB disabled")
+    payload = {
+        "client": {"clientId": "safeguard_bot", "clientVersion": "1.0"},
+        "threatInfo": {
+            "threatTypes": ["MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE"],
+            "platformTypes": ["ANY_PLATFORM"],
+            "threatEntryTypes": ["URL"],
+            "threatEntries": [{"url": u} for u in urls]
+        }
+    }
+    try:
+        r = requests.post(f"{GSB_LOOKUP}?key={GSB_API_KEY}", json=payload, timeout=8)
+        if r.status_code == 200:
+            matches = r.json().get("matches", [])
+            if matches:
+                kinds = {m.get("threatType","UNKNOWN") for m in matches}
+                return (True, f"Safe Browsing matches: {', '.join(sorted(kinds))} (Advisory provided by Google)")
+            return (False, "Safe Browsing: no matches")
+        return (False, f"Safe Browsing: status={r.status_code}")
+    except Exception as e:
+        return (False, f"Safe Browsing error: {e}")
+
+def check_phishtank(url: str) -> Tuple[bool, str]:
+    if requests is None: return (False, "PhishTank disabled")
+    data = {"url": url, "format": "json"}
+    if PHISHTANK_APP_KEY: data["app_key"] = PHISHTANK_APP_KEY
+    headers = {"User-Agent": "phishtank/safeguard_bot"}
+    try:
+        r = requests.post(PHISHTANK_CHECK, data=data, headers=headers, timeout=8)
+        if r.status_code == 200:
+            resp = r.json()
+            in_db = resp.get("results", {}).get("in_database", False)
+            valid = resp.get("results", {}).get("verified", False)
+            if in_db and valid:
+                return (True, "PhishTank: verified phishing")
+            return (False, "PhishTank: not found/unknown")
+        return (False, f"PhishTank: status={r.status_code}")
+    except Exception as e:
+        return (False, f"PhishTank error: {e}")
+
+def check_abuseipdb_ip(ip: str) -> Tuple[bool, str, int]:
+    if not ABUSEIPDB_API_KEY or requests is None: return (False, "AbuseIPDB disabled", 0)
+    headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
+    params = {"ipAddress": ip, "maxAgeInDays": "90"}
+    try:
+        r = requests.get(ABUSEIPDB_CHECK, headers=headers, params=params, timeout=8)
+        if r.status_code == 200:
+            data = r.json().get("data", {})
+            score = int(data.get("abuseConfidenceScore", 0))
+            if score >= ABUSEIPDB_CONFIDENCE_MIN:
+                return (True, f"AbuseIPDB: confidence={score}", score)
+            return (False, f"AbuseIPDB: confidence={score}", score)
+        return (False, f"AbuseIPDB: status={r.status_code}", 0)
+    except Exception as e:
+        return (False, f"AbuseIPDB error: {e}", 0)
+
+async def analyze_toxicity(text: str) -> Optional[dict]:
+    global _last_perspective_call_ts
+    if not PERSPECTIVE_API_KEY or requests is None or not text: return None
+    now = datetime.now().timestamp()
+    if now - _last_perspective_call_ts < 1.0:  # ~1 QPS
+        return None
+    _last_perspective_call_ts = now
+    payload = {
+        "comment": {"text": text[:3000]},
+        "languages": ["en"],  # adjust if needed
+        "requestedAttributes": {"TOXICITY": {}, "SEVERE_TOXICITY": {}, "INSULT": {}, "THREAT": {}}
+    }
+    try:
+        r = requests.post(f"{PERSPECTIVE_ANALYZE}?key={PERSPECTIVE_API_KEY}", json=payload, timeout=8)
+        if r.status_code == 200:
+            out = r.json().get("attributeScores", {})
+            return {k: float(v["summaryScore"]["value"]) for k, v in out.items() if "summaryScore" in v}
+        logger.debug(f"Perspective status={r.status_code} body={r.text[:200]}")
+        return None
+    except Exception as e:
+        logger.debug(f"Perspective error: {e}")
+        return None
 
 # -------- Helpers (async) --------
 async def delete_message_safe(update: Update, context):
@@ -112,18 +252,10 @@ async def delete_message_safe(update: Update, context):
         logger.warning(f"Delete failed: {e}")
 
 async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
-    # PTB >= 20.5: granular fields
     perms = ChatPermissions(
-        can_send_messages=False,
-        can_send_polls=False,
-        can_send_other_messages=False,
-        can_add_web_page_previews=False,
-        can_send_audios=False,
-        can_send_documents=False,
-        can_send_photos=False,
-        can_send_videos=False,
-        can_send_video_notes=False,
-        can_send_voice_notes=False,
+        can_send_messages=False, can_send_polls=False, can_send_other_messages=False,
+        can_add_web_page_previews=False, can_send_audios=False, can_send_documents=False,
+        can_send_photos=False, can_send_videos=False, can_send_video_notes=False, can_send_voice_notes=False,
     )
     try:
         await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until_date)
@@ -132,18 +264,10 @@ async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
         logger.warning(f"Restrict failed: {e}")
 
 async def unrestrict_user(chat_id: int, user_id: int, context):
-    # Re-enable typical messaging capabilities
     perms = ChatPermissions(
-        can_send_messages=True,
-        can_send_polls=True,
-        can_send_other_messages=True,
-        can_add_web_page_previews=True,
-        can_send_audios=True,
-        can_send_documents=True,
-        can_send_photos=True,
-        can_send_videos=True,
-        can_send_video_notes=True,
-        can_send_voice_notes=True,
+        can_send_messages=True, can_send_polls=True, can_send_other_messages=True,
+        can_add_web_page_previews=True, can_send_audios=True, can_send_documents=True,
+        can_send_photos=True, can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True,
     )
     try:
         await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms)
@@ -171,6 +295,30 @@ async def notify_admins(context, text: str, parse_mode=None):
         except Exception as e:
             logger.debug(f"notify_admins failed for {admin_id}: {e}")
 
+# -------- Incident response --------
+async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
+    """
+    severity: 'low' -> warn; 'medium' -> delete + warn; 'high' -> delete + restrict; 'critical' -> delete + restrict longer
+    """
+    if severity in ("medium","high","critical"):
+        await delete_message_safe(update, context)
+
+    total = add_warning(chat_id, user.id)
+    if severity == "low":
+        await context.bot.send_message(chat_id, f"⚠️ {reason}. Please avoid posting risky content, @{user.username or user.first_name}.")
+    elif severity == "medium":
+        await context.bot.send_message(chat_id, f"🛑 {reason}. Message removed. Warning ({total}/{WARN_LIMIT}).")
+    elif severity == "high":
+        await context.bot.send_message(chat_id, f"🚫 {reason}. You are temporarily muted for {MUTE_SECONDS}s.")
+        await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
+    else:  # critical
+        await context.bot.send_message(chat_id, f"⛔ {reason}. You are muted for {MUTE_SECONDS*3}s.")
+        await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS*3))
+
+    try:
+        await notify_admins(context, f"🔎 Security action\n• Chat: {chat_id}\n• UID: {user.id}\n• Reason: {reason}\n• Severity: {severity}")
+    except Exception: pass
+
 # -------- Diagnostics --------
 async def log_all_updates(update: Update, context):
     types = []
@@ -193,7 +341,6 @@ async def log_all_updates(update: Update, context):
 # -------- Commands --------
 async def cmd_start(update: Update, context):
     logger.info(f"[HANDLER] /start fired in chat_id={update.effective_chat.id}")
-    # Handle deep-link payloads for pre-join verification: /start join-<token>
     payload = None
     if update.message and update.message.text:
         parts = update.message.text.strip().split(maxsplit=1)
@@ -208,11 +355,9 @@ async def cmd_start(update: Update, context):
                 text="⚠️ Verification link is invalid or expired. Please request to join again."
             )
             return
-        # Issue a private CAPTCHA
         correct = random.randint(1, 4)
         options = list(range(1, 5)); random.shuffle(options)
         keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify_join:{token}:{int(n==correct)}")] for n in options]
-        # Track pending per user
         PENDING_CAPTCHA[update.effective_user.id] = {
             "chat_id": pending["chat_id"],
             "answer": correct,
@@ -226,7 +371,6 @@ async def cmd_start(update: Update, context):
         )
         return
 
-    # Default intro
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
         text=(
@@ -259,10 +403,9 @@ async def cmd_warnings(update: Update, context):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
     await context.bot.send_message(update.effective_chat.id, f"Your current warnings: {count}")
 
-# --- Admin-only commands: /ping & /diagnose ---
+# --- Admin-only commands ---
 async def cmd_ping(update: Update, context):
     if not is_admin(update.effective_user.id):
-        # Warn normal users for using admin-only command
         await enforce_admin_violation(update, context, "use admin-only commands (/ping)")
         return
     await context.bot.send_message(update.effective_chat.id, "🏓 pong")
@@ -312,8 +455,9 @@ async def cmd_function(update: Update, context):
         "• /ping – Quick connectivity test (admins only)\n"
         "• /diagnose – Show bot permissions & config (admins only)\n\n"
         "**Security Scanner**\n"
-        "• Send a **file** or **photo** to automatically scan with **VirusTotal** and get a readable summary.\n"
-        "  (Public API has rate limits; use wisely.)"
+        "• Link & IP reputation checks: Google Safe Browsing, VirusTotal, PhishTank, AbuseIPDB\n"
+        "• AI toxicity screening via Perspective API\n"
+        "• Send a **file/photo** to scan with **VirusTotal**."
     )
     await context.bot.send_message(update.effective_chat.id, text, parse_mode="Markdown")
 
@@ -386,20 +530,34 @@ async def moderate(update: Update, context):
     chat_id = update.effective_chat.id
     text = (msg.text or msg.caption or "")
 
-    # Opportunistically track username on any message (session-only)
+    # Track username (session-only)
     try:
         SESSION_USERNAMES[user.id] = user.username
-    except Exception:
-        pass
+    except Exception: pass
 
     if is_admin(user.id): return
 
+    # Flood control
     if record_user_message(chat_id, user.id) > FLOOD_MAX_MSG:
         await delete_message_safe(update, context)
         await context.bot.send_message(chat_id, f"⌛ Slow down, @{user.username or user.first_name} (muted {MUTE_SECONDS}s).")
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
         return
 
+    # Toxicity AI (Perspective)
+    if PERSPECTIVE_API_KEY and len(text) >= 10:
+        scores = await analyze_toxicity(text)
+        if scores:
+            tox = scores.get("TOXICITY", 0.0)
+            sev = scores.get("SEVERE_TOXICITY", 0.0)
+            ins = scores.get("INSULT", 0.0)
+            thr = scores.get("THREAT", 0.0)
+            if tox >= TOXICITY_THRESHOLD or sev >= SEVERE_TOXICITY_THRESHOLD or ins >= INSULT_THRESHOLD or thr >= THREAT_THRESHOLD:
+                reason = f"Toxic content detected (tox={tox:.2f}, severe={sev:.2f}, insult={ins:.2f}, threat={thr:.2f})"
+                await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
+                return
+
+    # Bad words
     if any(bad in text.lower() for bad in BAD_WORDS):
         await delete_message_safe(update, context)
         total = add_warning(chat_id, user.id)
@@ -410,12 +568,45 @@ async def moderate(update: Update, context):
             await context.bot.send_message(chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.")
         return
 
-    if BLOCK_LINKS and contains_link(text):
-        await delete_message_safe(update, context)
-        await context.bot.send_message(chat_id, "🔗 Links are not allowed here. If it’s class‑related, ask an admin.")
-        total = add_warning(chat_id, user.id)
-        if total >= WARN_LIMIT:
-            await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
+    urls = extract_urls(text)
+    ips = extract_ips(text, urls)
+
+    # Link reputation (GSB, PhishTank, VT optional)
+    if urls:
+        # Existing policy blocks links
+        if BLOCK_LINKS:
+            await delete_message_safe(update, context)
+            await context.bot.send_message(chat_id, "🔗 Links are restricted here. If it’s class‑related, ask an admin.")
+            add_warning(chat_id, user.id)
+        # Risk checks
+        gsb_bad, gsb_detail = check_google_safebrowsing(urls)
+        vt_bad, vt_detail = False, ""
+        pt_bad, pt_detail = False, ""
+        if urls:
+            vt_bad, vt_detail = check_virustotal_url(urls[0])
+            pt_bad, pt_detail = check_phishtank(urls[0])
+
+        if gsb_bad or vt_bad or pt_bad:
+            reasons = []
+            if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
+            if vt_bad: reasons.append(f"[VT] {vt_detail}")
+            if pt_bad: reasons.append(f"[PhishTank] {pt_detail}")
+            reason = " ; ".join(reasons)
+            severity = "high" if ("MALWARE" in gsb_detail or vt_bad or pt_bad) else "medium"
+            await auto_mitigate(update, context, user, chat_id, reason, severity=severity)
+            return
+
+    # IP reputation (AbuseIPDB)
+    if ips and ABUSEIPDB_API_KEY:
+        bad_hits = []
+        for ip in ips[:5]:
+            bad, detail, score = check_abuseipdb_ip(ip)
+            if bad: bad_hits.append((ip, score, detail))
+        if bad_hits:
+            worst = max(bad_hits, key=lambda x: x[1])
+            reason = f"IP reputation bad: {worst[0]} (confidence={worst[1]}) via AbuseIPDB"
+            await auto_mitigate(update, context, user, chat_id, reason, severity="high")
+            return
 
 # -------- Join alert + CAPTCHA (Post-join) --------
 async def welcome_verify(update: Update, context):
@@ -426,18 +617,15 @@ async def welcome_verify(update: Update, context):
         UNVERIFIED.add((chat_id, new_member.id))
         await restrict_user(chat_id, new_member.id, context, until_date=None)
 
-        # Build in-group CAPTCHA
         correct = random.randint(1, 4)
         options = list(range(1, 5)); random.shuffle(options)
         keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify:{new_member.id}:{int(n==correct)}")] for n in options]
         PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct, "mode": "post", "token": None}
 
-        # Details
         uid = new_member.id
         isbot = "true" if new_member.is_bot else "false"
         fn = new_member.first_name or "-"
         ln = new_member.last_name or "-"
-        # Session-only username alert line
         username_line = username_change_alert(uid, new_member.username)
         link = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
         lang = getattr(new_member, "language_code", None) or "-"
@@ -451,7 +639,6 @@ async def welcome_verify(update: Update, context):
         )
         await context.bot.send_message(chat_id, alert_group, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
-        # Admin alert (same username line)
         alert_admin = (
             "🔔 NEW MEMBER JOINED\n"
             f"• Group: {chat_title} ({chat_id})\n"
@@ -469,14 +656,12 @@ async def handle_join_request(update: Update, context):
     chat_title = req.chat.title or str(chat_id)
     user = req.from_user
 
-    # Create one-time token + deep-link for verification
     token = gen_token()
     PENDING_JOIN[token] = {"chat_id": chat_id, "user_id": user.id}
     deep_link = f"https://t.me/{BOT_USERNAME}?start=join-{token}" if BOT_USERNAME else None
     UNVERIFIED.add((chat_id, user.id))
     logger.info(f"JOIN REQUEST: stored token {token} for {(chat_id, user.id)}")
 
-    # Try DM the user (may fail if user hasn’t started the bot)
     dm_text = (
         "👋 You requested to join the group.\n"
         "Please complete the CAPTCHA to get approved.\n\n"
@@ -487,10 +672,8 @@ async def handle_join_request(update: Update, context):
     except Exception as e:
         logger.debug(f"DM to user failed (likely user never started bot): {e}")
 
-    # Record current username for session tracking
     SESSION_USERNAMES[user.id] = user.username
 
-    # Admin alert with session-only username line
     username_line = username_change_alert(user.id, user.username)
     admin_text = (
         "🔔 NEW JOIN REQUEST\n"
@@ -503,7 +686,7 @@ async def handle_join_request(update: Update, context):
     )
     await notify_admins(context, admin_text)
 
-# -------- VirusTotal scanning --------
+# -------- VirusTotal file scanning (existing) --------
 async def vt_scan_and_report(file_path: str, progress_msg):
     if requests is None:
         await progress_msg.edit_text("❌ 'requests' not installed. Add it to requirements.txt and redeploy."); return
@@ -511,7 +694,7 @@ async def vt_scan_and_report(file_path: str, progress_msg):
         await progress_msg.edit_text("❌ VirusTotal API key (VT_API_KEY) not configured."); return
     try:
         with open(file_path, "rb") as f:
-            resp = requests.post(VT_FILE_SCAN_URL, headers=VT_HEADERS, files={"file": f})
+            resp = requests.post(f"{VT_BASE}/files", headers={"x-apikey": VT_API_KEY}, files={"file": f})
             resp.raise_for_status()
             analysis_id = resp.json().get("data", {}).get("id")
             if not analysis_id:
@@ -521,10 +704,11 @@ async def vt_scan_and_report(file_path: str, progress_msg):
         await progress_msg.edit_text(f"❌ Upload error: {escape_markdown(str(e), version=2)}", parse_mode="MarkdownV2"); return
 
     idx, prev, attempts, max_attempts = 0, None, 0, 120
+    headers = {"x-apikey": VT_API_KEY}
     while attempts < max_attempts:
         await asyncio.sleep(5)
         try:
-            s = requests.get(VT_ANALYSES_URL_TPL.format(analysis_id), headers=VT_HEADERS)
+            s = requests.get(f"{VT_BASE}/analyses/{analysis_id}", headers=headers)
             s.raise_for_status()
             attrs = s.json().get("data", {}).get("attributes", {})
             if attrs.get("status") == "completed":
@@ -589,7 +773,6 @@ async def verify_callback(update: Update, context):
     q = update.callback_query; await q.answer()
     try:
         if q.data.startswith("verify:"):
-            # Post-join in-group verification
             _, uid_str, ok_str = q.data.split(":")
             user_id = int(uid_str); is_ok = bool(int(ok_str))
             pending = PENDING_CAPTCHA.get(user_id)
@@ -601,14 +784,12 @@ async def verify_callback(update: Update, context):
             if is_ok:
                 await unrestrict_user(chat_id, user_id, context)
                 UNVERIFIED.discard((chat_id, user_id))
-                # Welcome with name
-                name = f"{q.from_user.first_name or ''} {q.from_user.last_name or ''}".strip() or f"@{q.from_user.username}" if q.from_user.username else str(q.from_user.id)
+                name = f"{q.from_user.first_name or ''} {q.from_user.last_name or ''}".strip() or (f"@{q.from_user.username}" if q.from_user.username else str(q.from_user.id))
                 await q.edit_message_text(f"✅ Verified. Welcome {name}")
                 PENDING_CAPTCHA.pop(user_id, None)
             else:
                 await q.edit_message_text("❌ Wrong answer. Try again.")
         elif q.data.startswith("verify_join:"):
-            # Pre-join private verification
             _, token, ok_str = q.data.split(":")
             is_ok = bool(int(ok_str))
             pending_join = PENDING_JOIN.get(token)
@@ -624,16 +805,14 @@ async def verify_callback(update: Update, context):
                     UNVERIFIED.discard((chat_id, user_id))
                 except Exception as e:
                     logger.warning(f"approve_chat_join_request failed: {e}")
-                name = f"{q.from_user.first_name or ''} {q.from_user.last_name or ''}".strip() or f"@{q.from_user.username}" if q.from_user.username else str(q.from_user.id)
+                name = f"{q.from_user.first_name or ''} {q.from_user.last_name or ''}".strip() or (f"@{q.from_user.username}" if q.from_user.username else str(q.from_user.id))
                 await q.edit_message_text(f"✅ Verified. Welcome {name}")
                 PENDING_JOIN.pop(token, None)
                 PENDING_CAPTCHA.pop(user_id, None)
             else:
-                # Re-issue the same keyboard to retry
                 correct = PENDING_CAPTCHA.get(user_id, {}).get("answer", random.randint(1, 4))
                 options = list(range(1, 5)); random.shuffle(options)
                 keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify_join:{token}:{int(n==correct)}")] for n in options]
-                # Update stored answer
                 PENDING_CAPTCHA[user_id] = {"chat_id": chat_id, "answer": correct, "mode": "pre", "token": token}
                 await q.edit_message_text("❌ Wrong answer. Try again:", reply_markup=InlineKeyboardMarkup(keyboard))
     except Exception as e:
@@ -654,8 +833,8 @@ logger.info(f"WEBHOOK_URL: {WEBHOOK_URL or '(empty)'}")
 builder = (
     ApplicationBuilder()
     .token(BOT_TOKEN)
-    .updater(None)           # custom webhook pattern
-    .defaults(Defaults(block=False))  # non-blocking handlers
+    .updater(None)
+    .defaults(Defaults(block=False))
 )
 
 try:
@@ -672,34 +851,29 @@ async def on_error(update: object, context):
 
 application.add_error_handler(on_error)
 
-# ---- Handler registrations (AFTER functions) ----
+# ---- Handlers ----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
-
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
 
-# Commands
 application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
 application.add_handler(CommandHandler("rules", cmd_rules, block=False), group=1)
 application.add_handler(CommandHandler("report", cmd_report, block=False), group=1)
 application.add_handler(CommandHandler("warnings", cmd_warnings, block=False), group=1)
 application.add_handler(CommandHandler("function", cmd_function, block=False), group=1)
 
-# Admin-only registrations for ping/diagnose (enforced inside handlers)
+# Admin-only commands
 application.add_handler(CommandHandler("ping", cmd_ping, block=False), group=1)
 application.add_handler(CommandHandler("diagnose", cmd_diagnose, block=False), group=1)
 
-# Files/photos scanning
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)
 application.add_handler(MessageHandler(filters.PHOTO, scan_photo, block=False), group=1)
 
-# Post-join flow
+# Post-join & pre-join
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify), group=1)
-
-# Pre-join flow
 application.add_handler(ChatJoinRequestHandler(handle_join_request), group=1)
 
-# Unified verification callback (fixed pattern)
+# Unified verification callback
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^(verify:|verify_join:)"), group=1)
 
 # Moderation
@@ -744,7 +918,6 @@ async def healthz(request: Request): return JSONResponse({"status":"ok"})
 async def root(request: Request): return PlainTextResponse("OK", status_code=200)
 
 async def webhook(request: Request) -> Response:
-    # Optional secret header check
     if secret_is_valid(WEBHOOK_SECRET):
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
             logger.warning("Forbidden: secret mismatch"); return PlainTextResponse("forbidden", status_code=403)
@@ -760,7 +933,7 @@ routes = [
 ]
 app = Starlette(routes=routes)
 
-# ---- Async main: start PTB + Uvicorn and SERVE (blocks) ----
+# ---- Async main ----
 async def main():
     import uvicorn
     port = int(os.getenv("PORT", "10000"))
@@ -771,7 +944,6 @@ async def main():
     await application.initialize()
     await application.start()
 
-    # Resolve bot username for deep-links
     global BOT_USERNAME
     try:
         me = await application.bot.get_me()
@@ -780,7 +952,6 @@ async def main():
     except Exception as e:
         logger.warning(f"Failed to resolve BOT_USERNAME: {e}")
 
-    # set webhook (non-fatal on error)
     try:
         if WEBHOOK_URL:
             if secret_is_valid(WEBHOOK_SECRET):
@@ -799,11 +970,8 @@ async def main():
         logger.error(f"set_webhook failed: {e}")
 
     await set_my_commands()
-
-    # BLOCK here
     await server.serve()
 
-    # graceful stop
     await application.stop()
     await application.shutdown()
 
