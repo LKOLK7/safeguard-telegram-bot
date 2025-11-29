@@ -39,7 +39,7 @@ VT_API_KEY = os.getenv("VT_API_KEY", "")
 GSB_API_KEY = os.getenv("GSB_API_KEY", "")
 PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY", "")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
-PHISHTANK_APP_KEY = os.getenv("PHISHTANK_APP_KEY", "")
+# NOTE: PhishTank intentionally excluded per your request (registration disabled)
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
@@ -48,7 +48,6 @@ if not BOT_TOKEN:
 VT_BASE = "https://www.virustotal.com/api/v3"
 GSB_LOOKUP = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 ABUSEIPDB_CHECK = "https://api.abuseipdb.com/api/v2/check"
-PHISHTANK_CHECK = "http://checkurl.phishtank.com/checkurl/"
 PERSPECTIVE_ANALYZE = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
 
 # Policies
@@ -186,24 +185,6 @@ def check_google_safebrowsing(urls: List[str]) -> Tuple[bool, str]:
     except Exception as e:
         return (False, f"Safe Browsing error: {e}")
 
-def check_phishtank(url: str) -> Tuple[bool, str]:
-    if requests is None: return (False, "PhishTank disabled")
-    data = {"url": url, "format": "json"}
-    if PHISHTANK_APP_KEY: data["app_key"] = PHISHTANK_APP_KEY
-    headers = {"User-Agent": "phishtank/safeguard_bot"}
-    try:
-        r = requests.post(PHISHTANK_CHECK, data=data, headers=headers, timeout=8)
-        if r.status_code == 200:
-            resp = r.json()
-            in_db = resp.get("results", {}).get("in_database", False)
-            valid = resp.get("results", {}).get("verified", False)
-            if in_db and valid:
-                return (True, "PhishTank: verified phishing")
-            return (False, "PhishTank: not found/unknown")
-        return (False, f"PhishTank: status={r.status_code}")
-    except Exception as e:
-        return (False, f"PhishTank error: {e}")
-
 def check_abuseipdb_ip(ip: str) -> Tuple[bool, str, int]:
     if not ABUSEIPDB_API_KEY or requests is None: return (False, "AbuseIPDB disabled", 0)
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
@@ -295,6 +276,24 @@ async def notify_admins(context, text: str, parse_mode=None):
         except Exception as e:
             logger.debug(f"notify_admins failed for {admin_id}: {e}")
 
+# -------- NEW: Custom welcome message builder --------
+def build_welcome_message(name: str) -> str:
+    return (
+        f"👋 Welcome {name}! This bot helps keep our community safe and secure.\n\n"
+        "🔐 **Security Features Enabled:**\n"
+        "• **Post-Join Verification**: New members must pass a simple CAPTCHA before chatting.\n"
+        "• **Link Safety Checks**: URLs are scanned using Google Safe Browsing and VirusTotal to block phishing or malware.\n"
+        "• **IP Reputation Monitoring**: Detects risky IP addresses via AbuseIPDB.\n"
+        "• **AI-Powered Moderation**: Messages are analyzed for toxicity, threats, and harassment using Perspective API.\n"
+        "• **Automated Incident Response**: Suspicious content triggers immediate actions (delete, warn, mute) and alerts admins.\n\n"
+        "✅ Please follow the group rules:\n"
+        "• Be respectful and avoid offensive language.\n"
+        "• No spam, scams, or suspicious links.\n"
+        "• External links only when relevant and safe.\n\n"
+        "📌 If you have questions or need help, use `/report <reason>` to notify admins.\n"
+        "Developed by CCU Teams of Ministry of Post and Telecommunications (MPTC)."
+    )
+
 # -------- Incident response --------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
     """
@@ -371,13 +370,14 @@ async def cmd_start(update: Update, context):
         )
         return
 
+    # NEW: Personalized welcome message in DM
+    name = f"{update.effective_user.first_name or ''} {update.effective_user.last_name or ''}".strip() or (
+        f"@{update.effective_user.username}" if update.effective_user.username else str(update.effective_user.id)
+    )
     await context.bot.send_message(
         chat_id=update.effective_chat.id,
-        text=(
-            "Hello! I keep this group safe—moderation, anti‑spam, and new member verification.\n"
-            "Use /rules to see the code of conduct, /function to see all features, or /report to alert admins.\n\n"
-            "You can also send a file or photo and I’ll **scan it with VirusTotal** to check for malware."
-        )
+        text=build_welcome_message(name),
+        parse_mode="Markdown"
     )
 
 async def cmd_rules(update: Update, context):
@@ -455,7 +455,7 @@ async def cmd_function(update: Update, context):
         "• /ping – Quick connectivity test (admins only)\n"
         "• /diagnose – Show bot permissions & config (admins only)\n\n"
         "**Security Scanner**\n"
-        "• Link & IP reputation checks: Google Safe Browsing, VirusTotal, PhishTank, AbuseIPDB\n"
+        "• Link & IP reputation checks: Google Safe Browsing, VirusTotal, AbuseIPDB\n"
         "• AI toxicity screening via Perspective API\n"
         "• Send a **file/photo** to scan with **VirusTotal**."
     )
@@ -571,7 +571,7 @@ async def moderate(update: Update, context):
     urls = extract_urls(text)
     ips = extract_ips(text, urls)
 
-    # Link reputation (GSB, PhishTank, VT optional)
+    # Link reputation (GSB + VT)
     if urls:
         # Existing policy blocks links
         if BLOCK_LINKS:
@@ -581,18 +581,15 @@ async def moderate(update: Update, context):
         # Risk checks
         gsb_bad, gsb_detail = check_google_safebrowsing(urls)
         vt_bad, vt_detail = False, ""
-        pt_bad, pt_detail = False, ""
         if urls:
             vt_bad, vt_detail = check_virustotal_url(urls[0])
-            pt_bad, pt_detail = check_phishtank(urls[0])
 
-        if gsb_bad or vt_bad or pt_bad:
+        if gsb_bad or vt_bad:
             reasons = []
             if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
             if vt_bad: reasons.append(f"[VT] {vt_detail}")
-            if pt_bad: reasons.append(f"[PhishTank] {pt_detail}")
             reason = " ; ".join(reasons)
-            severity = "high" if ("MALWARE" in gsb_detail or vt_bad or pt_bad) else "medium"
+            severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
             await auto_mitigate(update, context, user, chat_id, reason, severity=severity)
             return
 
@@ -638,6 +635,12 @@ async def welcome_verify(update: Update, context):
             f"Please verify: pick **{correct}** to unlock chatting.\nUID: `{new_member.id}`"
         )
         await context.bot.send_message(chat_id, alert_group, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+        # NEW: Post the custom welcome message for new member (with name)
+        name = f"{new_member.first_name or ''} {new_member.last_name or ''}".strip() or (
+            f"@{new_member.username}" if new_member.username else str(new_member.id)
+        )
+        await context.bot.send_message(chat_id, build_welcome_message(name), parse_mode="Markdown")
 
         alert_admin = (
             "🔔 NEW MEMBER JOINED\n"
@@ -976,4 +979,3 @@ async def main():
     await application.shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(main())
