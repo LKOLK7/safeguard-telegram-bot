@@ -289,8 +289,8 @@ def build_welcome_message(name: str) -> str:
         "• Be respectful and avoid offensive language.\n"
         "• No spam, scams, or suspicious links.\n"
         "• External links only when relevant and safe.\n\n"
-        "📌 If you have questions or need help, use `/report <reason>` to notify admins.\n"
-        "Developed by CCU Teams of Ministry of Post and Telecommunications (MPTC)."
+        "📌 If you have questions or need help, use `/report <reason>` to notify admins.\n\n"
+        "✅ Developed by CCU Teams of Ministry of Post and Telecommunications (MPTC)."
     )
 
 # -------- Incident response --------
@@ -737,7 +737,7 @@ async def vt_scan_and_report(file_path: str, progress_msg):
                     f"• ✅ *Harmless:* `{stats.get('harmless', 0)}`\n"
                     f"• ❓ *Undetected:* `{stats.get('undetected', 0)}`\n\n"
                     f"🧠 **Detected details:**\n{grouped}\n\n"
-                    f"Powered by VirusTotal API v3"
+                    f"Powered by CCU Teams of MPTC"
                 )
                 await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
                 try: os.remove(file_path)
