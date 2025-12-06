@@ -78,6 +78,11 @@ ENGINES_FOR_PROGRESS = [
     "McAfee","DrWeb","Fortinet","ClamAV","Paloalto","Malwarebytes","VIPRE"
 ]
 
+# ---- Preferred engines for summary (Top 1–Top 3) ----
+DEFAULT_TOP_ENGINES = ["Microsoft", "Kaspersky", "BitDefender"]
+TOP_ENGINES = [x.strip() for x in os.getenv("TOP_ENGINES", ",".join(DEFAULT_TOP_ENGINES)).split(",") if x.strip()]
+TOP_ENGINES = (TOP_ENGINES or DEFAULT_TOP_ENGINES)[:3]
+
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
@@ -676,13 +681,53 @@ async def handle_join_request(update: Update, context):
     )
     await notify_admins(context, admin_text)
 
-# ------------- VirusTotal file scanning (updated output) -------------
+# ------------- VirusTotal file scanning (updated output with Top 3 engines) -------------
+def _normalize(s: str) -> str:
+    return re.sub(r"[\s_\-]+", "", (s or "")).lower()
+
+def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, str]:
+    """
+    Find the best matching engine name in VirusTotal 'results' for target_engine.
+    Returns (category, result) where category ∈ {malicious, suspicious, harmless, undetected, ...},
+    result is the signature string or None.
+    If engine is not found, returns ('undetected', None) treating it as Clean.
+    """
+    if not results:
+        return ("undetected", None)
+    tnorm = _normalize(target_engine)
+    best_key = None
+    # Prefer exact (normalized) match, else substring match
+    for k in results.keys():
+        knorm = _normalize(k)
+        if knorm == tnorm:
+            best_key = k
+            break
+    if best_key is None:
+        for k in results.keys():
+            knorm = _normalize(k)
+            if tnorm in knorm or knorm in tnorm:
+                best_key = k
+                break
+    if best_key is None:
+        return ("undetected", None)
+    det = results.get(best_key, {}) or {}
+    return (det.get("category") or "undetected", det.get("result"))
+
+def _format_engine_line(rank: int, engine_name: str, category: str, result: Optional[str]) -> str:
+    """
+    Returns human-friendly line: '- Top N: <status>'
+    status is 'Detected (<signature>)' if malicious/suspicious, else 'Clean'
+    """
+    detected = (category in ("malicious", "suspicious"))
+    status = f"Detected ({result})" if detected and result else ("Detected" if detected else "Clean")
+    return f"- Top {rank}: {engine_name} – {status}"
+
 async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
     """
     Uploads the file to VirusTotal, waits for analysis completion, then reports:
     - File name
     - Overall stats
-    - Top 3 detections only (malicious first, then suspicious)
+    - Virus Engines (Top 1–Top 3): Clean or Detected
     """
     if requests is None:
         await progress_msg.edit_text("❌ 'requests' not installed. Add it to requirements.txt and redeploy."); return
@@ -711,30 +756,16 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
             s.raise_for_status()
             attrs = s.json().get("data", {}).get("attributes", {})
             if attrs.get("status") == "completed":
-                stats = attrs.get("stats", {})
+                stats = attrs.get("stats", {}) or {}
                 results = attrs.get("results", {}) or {}
 
-                # Collect detections only
-                detections = []
-                for engine, det in results.items():
-                    cat = det.get("category")
-                    res = det.get("result")
-                    if cat in ("malicious", "suspicious"):
-                        detections.append((engine, cat, res or ("Suspicious" if cat == "suspicious" else "Malicious")))
-
-                # Sort: malicious first, then suspicious; stable by engine name
-                cat_rank = {"malicious": 0, "suspicious": 1}
-                detections.sort(key=lambda x: (cat_rank.get(x[1], 2), x[0].lower()))
-
-                top3 = detections[:3]
-
-                # Build compact details
+                # Build Top 1–Top 3 engine lines
+                chosen = TOP_ENGINES[:3]
                 lines = []
-                for engine, cat, res in top3:
-                    badge = "🔴" if cat == "malicious" else "🟠"
-                    lines.append(f"• {engine}: {res} {badge}")
-
-                details_block = "No detected engines." if not lines else "\n".join(lines)
+                for i, eng in enumerate(chosen, start=1):
+                    cat, res = _pick_engine_result(results, eng)
+                    lines.append(_format_engine_line(i, eng, cat, res))
+                engines_block = "\n".join(lines)
 
                 summary = (
                     f"✅ **Scan Complete!**\n\n"
@@ -744,7 +775,8 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
                     f"• ⚠️ **Suspicious:** `{stats.get('suspicious', 0)}`\n"
                     f"• ✅ **Harmless:** `{stats.get('harmless', 0)}`\n"
                     f"• ❓ **Undetected:** `{stats.get('undetected', 0)}`\n\n"
-                    f"🧠 **Top detections (max 3):**\n{escape_markdown(details_block, version=2)}\n\n"
+                    f"🧪 **Virus Engines:**\n"
+                    f"{escape_markdown(engines_block, version=2)}\n\n"
                     f"Powered by CCU Teams of MPTC"
                 )
                 await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
