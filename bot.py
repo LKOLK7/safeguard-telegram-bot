@@ -91,14 +91,12 @@ def is_admin(user_id: int) -> bool:
 
 # ------------- Defang / Deobfuscation + URL/Domain extraction -------------
 
-# Remove zero-width/invisible chars that attackers use to split tokens
 ZERO_WIDTH_CHARS = r"[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]"
 ZERO_WIDTH_PATTERN = re.compile(ZERO_WIDTH_CHARS)
 
 def strip_zero_width(text: str) -> str:
     return ZERO_WIDTH_PATTERN.sub("", text or "")
 
-# Common defang patterns: hxxp, https[:]//, [.] etc. + collapse spaced letters (g i t h u b . com)
 DEFANG_SUBS = [
     (re.compile(r"hxxps", re.I), "https"),
     (re.compile(r"hxxp", re.I), "http"),
@@ -112,7 +110,6 @@ DEFANG_SUBS = [
     (re.compile(r"\s*\(\s*dot\s*\)\s*", re.I), "."),
     (re.compile(r"\s*\[\s*dot\s*\]\s*", re.I), "."),
     (re.compile(r"\s*{\s*dot\s*}\s*", re.I), "."),
-    # collapse single spaces between alnums: "g i t h u b" -> "github"
     (re.compile(r"(?i)\b([a-z0-9])\s+(?=[a-z0-9])"), r"\1"),
 ]
 
@@ -120,29 +117,17 @@ def deobfuscate_text(text: str) -> str:
     t = strip_zero_width(text)
     for pat, repl in DEFANG_SUBS:
         t = pat.sub(repl, t)
-    # collapse multiple spaces
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
-# URLs with scheme
 URL_WITH_SCHEME = re.compile(r"(?i)\b(?:https?|ftp)://[^\s<>\"']+")
-
-# Bare domains (no scheme) -> we’ll add http://
-# Simple, safe pattern (no VERBOSE / nested groups)
 DOMAIN_SIMPLE = re.compile(r"\b(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?")
-
-# t.me / telegram.me shortcuts (bare)
 TELEGRAM_DOMAIN = re.compile(r"(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?")
 
 def extract_urls_and_domains(text: str) -> List[str]:
-    """
-    Returns normalized URLs (with scheme). Converts bare domains to http://domain.
-    Handles defanged links and common obfuscations to prevent bypass.
-    """
     if not text:
         return []
     t = deobfuscate_text(text)
-
     urls = set()
 
     for m in URL_WITH_SCHEME.finditer(t):
@@ -162,7 +147,6 @@ def extract_urls_and_domains(text: str) -> List[str]:
         else:
             urls.add(raw)
 
-    # handle @username -> t.me/username
     for m in re.finditer(r"(?i)@\w{5,}", t):
         username = m.group(0)[1:]
         urls.add(f"https://t.me/{username}")
@@ -185,9 +169,7 @@ def extract_ips(text: str, urls: List[str]) -> List[str]:
         parts = ip.split(".")
         if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
             out.append(ip)
-    # unique preserve order
-    seen = set()
-    uniq = []
+    seen = set(); uniq = []
     for ip in out:
         if ip not in seen:
             uniq.append(ip); seen.add(ip)
@@ -222,7 +204,7 @@ def check_virustotal_url(url: str) -> Tuple[bool, str]:
 def check_google_safebrowsing(urls: List[str]) -> Tuple[bool, str]:
     if not GSB_API_KEY or requests is None or not urls: return (False, "GSB disabled")
     payload = {
-        "client": {"clientId": "safeguard_bot", "clientVersion": "1.0"},
+        "client": {"clientId": "safebrowsing_bot", "clientVersion": "1.0"},
         "threatInfo": {
             "threatTypes": ["MALWARE","SOCIAL_ENGINEERING","UNWANTED_SOFTWARE"],
             "platformTypes": ["ANY_PLATFORM"],
@@ -333,11 +315,11 @@ def build_welcome_message(name: str) -> str:
     return (
         f"👋 Welcome {name}! This bot helps keep our community safe and secure.\n\n"
         "🔐 **Security Features Enabled:**\n"
-        "• **Post-Join Verification**\n"
-        "• **Link Safety Checks** (Google Safe Browsing & VirusTotal)\n"
-        "• **IP Reputation Monitoring** (AbuseIPDB)\n"
-        "• **AI-Powered Moderation** (Perspective API)\n"
-        "• **Automated Incident Response**\n\n"
+        "• Post-Join Verification\n"
+        "• Link Safety Checks (GSB & VirusTotal)\n"
+        "• IP Reputation Monitoring (AbuseIPDB)\n"
+        "• AI-Powered Moderation (Perspective API)\n"
+        "• Automated Incident Response\n\n"
         "✅ Please follow the group rules:\n"
         "• Be respectful • No spam • External links only when relevant\n\n"
         "📌 Use `/report <reason>` to notify admins.\n\n"
@@ -534,14 +516,12 @@ async def moderate(update: Update, context):
     if is_admin(user.id):
         return
 
-    # Flood control
     if record_user_message(chat_id, user.id) > FLOOD_MAX_MSG:
         await delete_message_safe(update, context)
         await context.bot.send_message(chat_id, f"⌛ Slow down, @{user.username or user.first_name} (muted {MUTE_SECONDS}s).")
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
         return
 
-    # Toxicity AI
     if PERSPECTIVE_API_KEY and len(text) >= 10:
         scores = await analyze_toxicity(text)
         if scores:
@@ -554,7 +534,6 @@ async def moderate(update: Update, context):
                 await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
                 return
 
-    # Bad words
     if any(bad in text.lower() for bad in BAD_WORDS):
         await delete_message_safe(update, context)
         total = add_warning(chat_id, user.id)
@@ -565,7 +544,6 @@ async def moderate(update: Update, context):
             await context.bot.send_message(chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.")
         return
 
-    # Robust URL/domain extraction
     urls = extract_urls_and_domains(text)
 
     if urls:
@@ -574,7 +552,6 @@ async def moderate(update: Update, context):
             await context.bot.send_message(chat_id, "🔗 Links are restricted here. If it’s class‑related, ask an admin.")
             add_warning(chat_id, user.id)
 
-        # Risk checks
         gsb_bad, gsb_detail = check_google_safebrowsing(urls)
         vt_bad, vt_detail = False, ""
         if urls:
@@ -603,7 +580,6 @@ async def moderate(update: Update, context):
 # ------------- Join alert + CAPTCHA (Post-join) -------------
 async def welcome_verify(update: Update, context):
     chat_id = update.effective_chat.id
-    chat_title = update.effective_chat.title or str(chat_id)
     for new_member in update.message.new_chat_members:
         UNVERIFIED.add((chat_id, new_member.id))
         await restrict_user(chat_id, new_member.id, context, until_date=None)
@@ -629,7 +605,7 @@ async def handle_join_request(update: Update, context):
     except Exception:
         pass
 
-# ------------- VirusTotal file scanning (updated output w/ configurable Top 3) -------------
+# ------------- VirusTotal file scanning (Summary logic per your spec) -------------
 def _normalize(s: str) -> str:
     return re.sub(r"[\s_\-]+", "", (s or "")).lower()
 
@@ -687,14 +663,16 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
                 stats = attrs.get("stats", {}) or {}
                 results = attrs.get("results", {}) or {}
 
-                total_engines = len(results) if results else (
-                    int(stats.get("malicious", 0)) +
-                    int(stats.get("suspicious", 0)) +
-                    int(stats.get("undetected", 0)) +
-                    int(stats.get("harmless", 0))
-                )
-                undetected = int(stats.get("undetected", 0))
+                # Counts
+                mal = int(stats.get("malicious", 0))
+                sus = int(stats.get("suspicious", 0))
+                und = int(stats.get("undetected", 0))
+                har = int(stats.get("harmless", 0))
 
+                # Undetected denominator (exclude harmless)
+                total_for_und = (mal + sus + und) if (mal + sus + und) > 0 else und
+
+                # Build Top 1–Top 3 engine lines
                 chosen = TOP_ENGINES[:3]
                 lines = []
                 for i, eng in enumerate(chosen, start=1):
@@ -702,17 +680,29 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
                     lines.append(_format_engine_line(i, eng, cat, res))
                 engines_block = "\n".join(lines)
 
+                # Summary rendering:
+                # If any detection/harmless exists -> show all four lines including Undetected
+                # Else -> show only Undetected
+                if (mal > 0) or (sus > 0) or (har > 0):
+                    summary_body = (
+                        f"• 🛡 **Malicious:** `{mal}`\n"
+                        f"• ⚠️ **Suspicious:** `{sus}`\n"
+                        f"• ✅ **Harmless:** `{har}`\n"
+                        f"• ❓ **Undetected:** `{und}/{total_for_und}`\n"
+                    )
+                else:
+                    summary_body = f"• ❓ **Undetected:** `{und}/{total_for_und}`\n"
+
                 summary = (
                     f"✅ **Scan Complete!**\n\n"
                     f"📄 **File:** `{escape_markdown(display_name, version=2)}`\n"
                     f"🔎 **Summary:**\n"
-                    f"• 🛡 **Malicious:** `{stats.get('malicious', 0)}`\n"
-                    f"• ⚠️ **Suspicious:** `{stats.get('suspicious', 0)}`\n"
-                    f"• ❓ **Undetected:** `{undetected}/{total_engines}`\n\n"
+                    f"{summary_body}\n"
                     f"🧪 **Virus Engines:**\n"
                     f"{escape_markdown(engines_block, version=2)}\n\n"
                     f"Powered by CCU Teams of MPTC"
                 )
+
                 await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
                 try: os.remove(file_path)
                 except Exception as e: logger.error(f"Delete temp file failed: {e}")
@@ -824,11 +814,9 @@ application.add_error_handler(on_error)
 
 # ---- Handlers ----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
-
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
 
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
-
 application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
 application.add_handler(CommandHandler("rules", cmd_rules, block=False), group=1)
 application.add_handler(CommandHandler("report", cmd_report, block=False), group=1)
