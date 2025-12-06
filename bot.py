@@ -695,12 +695,12 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
 
                 summary = (
                     f"✅ **Scan Complete!**\n\n"
-                    f"📄 **File:** `{escape_markdown(display_name, version=2)}`\n"
+                    f"📄 **File:** `{escape_markdown(display_name, version=2)}`\n\n"
                     f"🔎 **Summary:**\n"
                     f"{summary_body}\n"
                     f"🧪 **Virus Engines:**\n"
                     f"{escape_markdown(engines_block, version=2)}\n\n"
-                    f"Powered by CCU Teams of MPTC"
+                    f"🔔 Powered by CCU Teams of MPTC"
                 )
 
                 await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
