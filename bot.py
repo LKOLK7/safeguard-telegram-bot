@@ -4,19 +4,16 @@ import os, re, sys, random, logging, asyncio, string, base64, json
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from urllib.parse import urlparse
-
 # Optional dependency for external APIs
 try:
     import requests
 except ImportError:
     requests = None
-
 from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.helpers import escape_markdown
 import telegram
-
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -39,7 +36,6 @@ VT_API_KEY = os.getenv("VT_API_KEY", "")
 GSB_API_KEY = os.getenv("GSB_API_KEY", "")
 PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY", "")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
-
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
 
@@ -65,12 +61,12 @@ THREAT_THRESHOLD = float(os.getenv("THREAT_THRESHOLD", "0.60"))
 ABUSEIPDB_CONFIDENCE_MIN = int(os.getenv("ABUSEIPDB_CONFIDENCE_MIN", "75"))
 
 # State (in-memory only; no persistence)
-PENDING_CAPTCHA = {}   # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
-PENDING_JOIN = {}      # token -> {"chat_id": ..., "user_id": ...}
-USER_WARNINGS = {}     # (chat_id, user_id) -> count
-USER_MSG_TIMES = {}    # (chat_id, user_id) -> timestamps
-UNVERIFIED = set()     # {(chat_id, user_id)}
-BOT_USERNAME = None    # filled at startup
+PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
+PENDING_JOIN = {}     # token -> {"chat_id": ..., "user_id": ...}
+USER_WARNINGS = {}    # (chat_id, user_id) -> count
+USER_MSG_TIMES = {}   # (chat_id, user_id) -> timestamps
+UNVERIFIED = set()    # {(chat_id, user_id)}
+BOT_USERNAME = None   # filled at startup
 SESSION_USERNAMES: dict[int, Optional[str]] = {}
 
 # Simple throttle for Perspective (~1 QPS default)
@@ -98,7 +94,7 @@ def gen_token(length: int = 24) -> str:
     alphabet = string.ascii_letters + string.digits + "_-"
     return "".join(random.choice(alphabet) for _ in range(length))
 
-# ---------- Utilities ----------
+# ------------- Utilities -------------
 def extract_urls(text: str) -> List[str]:
     if not text: return []
     candidates = re.findall(r"https?://\S+|www\.\S+", text, flags=re.IGNORECASE)
@@ -135,7 +131,7 @@ def username_change_alert(user_id: int, current_username: Optional[str]) -> str:
         return f"• username changed: {_fmt_username(last)} → {_fmt_username(current_username)}"
     return f"• username: {_fmt_username(current_username)}"
 
-# ---------- External checks ----------
+# ------------- External checks -------------
 def vt_url_id(url: str) -> str:
     raw = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
     return raw
@@ -223,7 +219,7 @@ async def analyze_toxicity(text: str) -> Optional[dict]:
         logger.debug(f"Perspective error: {e}")
         return None
 
-# -------- Helpers (async) --------
+# ------------- Helpers (async) -------------
 async def delete_message_safe(update: Update, context):
     try:
         await context.bot.delete_message(update.effective_chat.id, update.effective_message.message_id)
@@ -275,7 +271,7 @@ async def notify_admins(context, text: str, parse_mode=None):
         except Exception as e:
             logger.debug(f"notify_admins failed for {admin_id}: {e}")
 
-# -------- NEW: Custom welcome message builder --------
+# ------------- NEW: Custom welcome message builder -------------
 def build_welcome_message(name: str) -> str:
     return (
         f"👋 Welcome {name}! This bot helps keep our community safe and secure.\n\n"
@@ -293,14 +289,13 @@ def build_welcome_message(name: str) -> str:
         "✅ Developed by CCU Teams of Ministry of Post and Telecommunications (MPTC)."
     )
 
-# -------- Incident response --------
+# ------------- Incident response -------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
     """
     severity: 'low' -> warn; 'medium' -> delete + warn; 'high' -> delete + restrict; 'critical' -> delete + restrict longer
     """
     if severity in ("medium","high","critical"):
         await delete_message_safe(update, context)
-
     total = add_warning(chat_id, user.id)
     if severity == "low":
         await context.bot.send_message(chat_id, f"⚠️ {reason}. Please avoid posting risky content, @{user.username or user.first_name}.")
@@ -312,12 +307,12 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
     else:  # critical
         await context.bot.send_message(chat_id, f"⛔ {reason}. You are muted for {MUTE_SECONDS*3}s.")
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS*3))
-
     try:
         await notify_admins(context, f"🔎 Security action\n• Chat: {chat_id}\n• UID: {user.id}\n• Reason: {reason}\n• Severity: {severity}")
-    except Exception: pass
+    except Exception:
+        pass
 
-# -------- Diagnostics --------
+# ------------- Diagnostics -------------
 async def log_all_updates(update: Update, context):
     types = []
     if update.message: types.append("message")
@@ -336,7 +331,7 @@ async def log_all_updates(update: Update, context):
     if update.chat_join_request: types.append("chat_join_request")
     logger.info(f"UPDATE TYPES: {types}")
 
-# -------- Commands --------
+# ------------- Commands -------------
 async def cmd_start(update: Update, context):
     logger.info(f"[HANDLER] /start fired in chat_id={update.effective_chat.id}")
     payload = None
@@ -460,7 +455,7 @@ async def cmd_function(update: Update, context):
     )
     await context.bot.send_message(update.effective_chat.id, text, parse_mode="Markdown")
 
-# -------- Admin policy controls --------
+# ------------- Admin policy controls -------------
 async def enforce_admin_violation(update: Update, context, action_label: str):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -509,7 +504,7 @@ async def togglelinks(update: Update, context):
     BLOCK_LINKS = not BLOCK_LINKS
     await context.bot.send_message(update.effective_chat.id, f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
 
-# -------- Gate --------
+# ------------- Gate -------------
 async def gate_unverified(update: Update, context):
     chat = update.effective_chat
     user = update.effective_user
@@ -522,13 +517,12 @@ async def gate_unverified(update: Update, context):
         except Exception:
             pass
 
-# -------- Moderation --------
+# ------------- Moderation -------------
 async def moderate(update: Update, context):
     msg = update.effective_message
     user = msg.from_user
     chat_id = update.effective_chat.id
     text = (msg.text or msg.caption or "")
-
     # Track username (session-only)
     try:
         SESSION_USERNAMES[user.id] = user.username
@@ -577,12 +571,12 @@ async def moderate(update: Update, context):
             await delete_message_safe(update, context)
             await context.bot.send_message(chat_id, "🔗 Links are restricted here. If it’s class‑related, ask an admin.")
             add_warning(chat_id, user.id)
+
         # Risk checks
         gsb_bad, gsb_detail = check_google_safebrowsing(urls)
         vt_bad, vt_detail = False, ""
         if urls:
             vt_bad, vt_detail = check_virustotal_url(urls[0])
-
         if gsb_bad or vt_bad:
             reasons = []
             if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
@@ -604,7 +598,7 @@ async def moderate(update: Update, context):
             await auto_mitigate(update, context, user, chat_id, reason, severity="high")
             return
 
-# -------- Join alert + CAPTCHA (Post-join) --------
+# ------------- Join alert + CAPTCHA (Post-join) -------------
 async def welcome_verify(update: Update, context):
     chat_id = update.effective_chat.id
     chat_title = update.effective_chat.title or str(chat_id)
@@ -612,12 +606,10 @@ async def welcome_verify(update: Update, context):
         logger.info(f"NEW_CHAT_MEMBER: {new_member.id} joined chat {chat_id}")
         UNVERIFIED.add((chat_id, new_member.id))
         await restrict_user(chat_id, new_member.id, context, until_date=None)
-
         correct = random.randint(1, 4)
         options = list(range(1, 5)); random.shuffle(options)
         keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify:{new_member.id}:{int(n==correct)}")] for n in options]
         PENDING_CAPTCHA[new_member.id] = {"chat_id": chat_id, "answer": correct, "mode": "post", "token": None}
-
         uid = new_member.id
         isbot = "true" if new_member.is_bot else "false"
         fn = new_member.first_name or "-"
@@ -625,7 +617,6 @@ async def welcome_verify(update: Update, context):
         username_line = username_change_alert(uid, new_member.username)
         link = f"(https://t.me/{new_member.username})" if new_member.username else "(-)"
         lang = getattr(new_member, "language_code", None) or "-"
-
         alert_group = (
             "📣 NEW MEMBER ALERT\n"
             f"• Group: {chat_title} ({chat_id})\n"
@@ -651,19 +642,17 @@ async def welcome_verify(update: Update, context):
         )
         await notify_admins(context, alert_admin)
 
-# -------- Join Request (Pre-join verification) --------
+# ------------- Join Request (Pre-join verification) -------------
 async def handle_join_request(update: Update, context):
     req = update.chat_join_request
     chat_id = req.chat.id
     chat_title = req.chat.title or str(chat_id)
     user = req.from_user
-
     token = gen_token()
     PENDING_JOIN[token] = {"chat_id": chat_id, "user_id": user.id}
     deep_link = f"https://t.me/{BOT_USERNAME}?start=join-{token}" if BOT_USERNAME else None
     UNVERIFIED.add((chat_id, user.id))
     logger.info(f"JOIN REQUEST: stored token {token} for {(chat_id, user.id)}")
-
     dm_text = (
         "👋 You requested to join the group.\n"
         "Please complete the CAPTCHA to get approved.\n\n"
@@ -675,7 +664,6 @@ async def handle_join_request(update: Update, context):
         logger.debug(f"DM to user failed (likely user never started bot): {e}")
 
     SESSION_USERNAMES[user.id] = user.username
-
     username_line = username_change_alert(user.id, user.username)
     admin_text = (
         "🔔 NEW JOIN REQUEST\n"
@@ -688,23 +676,32 @@ async def handle_join_request(update: Update, context):
     )
     await notify_admins(context, admin_text)
 
-# -------- VirusTotal file scanning (existing) --------
-async def vt_scan_and_report(file_path: str, progress_msg):
+# ------------- VirusTotal file scanning (updated output) -------------
+async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
+    """
+    Uploads the file to VirusTotal, waits for analysis completion, then reports:
+    - File name
+    - Overall stats
+    - Top 3 detections only (malicious first, then suspicious)
+    """
     if requests is None:
         await progress_msg.edit_text("❌ 'requests' not installed. Add it to requirements.txt and redeploy."); return
     if not VT_API_KEY:
         await progress_msg.edit_text("❌ VirusTotal API key (VT_API_KEY) not configured."); return
+
+    # Upload
     try:
         with open(file_path, "rb") as f:
             resp = requests.post(f"{VT_BASE}/files", headers={"x-apikey": VT_API_KEY}, files={"file": f})
             resp.raise_for_status()
             analysis_id = resp.json().get("data", {}).get("id")
-            if not analysis_id:
-                await progress_msg.edit_text("❌ Failed to get analysis ID from VirusTotal."); return
+        if not analysis_id:
+            await progress_msg.edit_text("❌ Failed to get analysis ID from VirusTotal."); return
         await progress_msg.edit_text("✅ File uploaded! Scanning in progress...")
     except Exception as e:
         await progress_msg.edit_text(f"❌ Upload error: {escape_markdown(str(e), version=2)}", parse_mode="MarkdownV2"); return
 
+    # Poll for completion and build compact report
     idx, prev, attempts, max_attempts = 0, None, 0, 120
     headers = {"x-apikey": VT_API_KEY}
     while attempts < max_attempts:
@@ -715,28 +712,39 @@ async def vt_scan_and_report(file_path: str, progress_msg):
             attrs = s.json().get("data", {}).get("attributes", {})
             if attrs.get("status") == "completed":
                 stats = attrs.get("stats", {})
-                results = attrs.get("results", {})
-                malicious, suspicious, clean = [], [], []
-                for engine, det in results.items():
-                    cat = det.get("category"); res = det.get("result")
-                    if cat == "malicious": malicious.append(f"• {engine}: {res}")
-                    elif cat == "suspicious": suspicious.append(f"• {engine}: {res or 'Suspicious'}")
-                    else: clean.append(f"• {engine}: clean")
+                results = attrs.get("results", {}) or {}
 
-                grouped = "──────────────\n"
-                if malicious: grouped += "🔴 *Malicious:*\n" + "\n".join(malicious) + "\n\n"
-                if suspicious: grouped += "🟠 *Suspicious:*\n" + "\n".join(suspicious) + "\n\n"
-                if clean: grouped += "✅ *Clean:*\n" + "\n".join(clean) + "\n"
-                grouped += "──────────────"
+                # Collect detections only
+                detections = []
+                for engine, det in results.items():
+                    cat = det.get("category")
+                    res = det.get("result")
+                    if cat in ("malicious", "suspicious"):
+                        detections.append((engine, cat, res or ("Suspicious" if cat == "suspicious" else "Malicious")))
+
+                # Sort: malicious first, then suspicious; stable by engine name
+                cat_rank = {"malicious": 0, "suspicious": 1}
+                detections.sort(key=lambda x: (cat_rank.get(x[1], 2), x[0].lower()))
+
+                top3 = detections[:3]
+
+                # Build compact details
+                lines = []
+                for engine, cat, res in top3:
+                    badge = "🔴" if cat == "malicious" else "🟠"
+                    lines.append(f"• {engine}: {res} {badge}")
+
+                details_block = "No detected engines." if not lines else "\n".join(lines)
 
                 summary = (
                     f"✅ **Scan Complete!**\n\n"
+                    f"📄 **File:** `{escape_markdown(display_name, version=2)}`\n"
                     f"🔎 **Summary:**\n"
-                    f"• 🛡 *Malicious:* `{stats.get('malicious', 0)}`\n"
-                    f"• ⚠️ *Suspicious:* `{stats.get('suspicious', 0)}`\n"
-                    f"• ✅ *Harmless:* `{stats.get('harmless', 0)}`\n"
-                    f"• ❓ *Undetected:* `{stats.get('undetected', 0)}`\n\n"
-                    f"🧠 **Detected details:**\n{grouped}\n\n"
+                    f"• 🛡 **Malicious:** `{stats.get('malicious', 0)}`\n"
+                    f"• ⚠️ **Suspicious:** `{stats.get('suspicious', 0)}`\n"
+                    f"• ✅ **Harmless:** `{stats.get('harmless', 0)}`\n"
+                    f"• ❓ **Undetected:** `{stats.get('undetected', 0)}`\n\n"
+                    f"🧠 **Top detections (max 3):**\n{escape_markdown(details_block, version=2)}\n\n"
                     f"Powered by CCU Teams of MPTC"
                 )
                 await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
@@ -760,17 +768,19 @@ async def scan_document(update: Update, context):
     doc = update.message.document
     file = await doc.get_file()
     path = await file.download_to_drive()
+    display_name = doc.file_name or os.path.basename(path)
     progress = await context.bot.send_message(update.effective_chat.id, "⏳ Uploading file to VirusTotal and starting scan...")
-    await vt_scan_and_report(path, progress)
+    await vt_scan_and_report(path, progress, display_name)
 
 async def scan_photo(update: Update, context):
     photo = update.message.photo[-1]
     file = await photo.get_file()
     path = await file.download_to_drive()
+    display_name = os.path.basename(path)  # Telegram provides a generated name; use basename
     progress = await context.bot.send_message(update.effective_chat.id, "⏳ Uploading image to VirusTotal and starting scan...")
-    await vt_scan_and_report(path, progress)
+    await vt_scan_and_report(path, progress, display_name)
 
-# -------- Verify button (both modes) --------
+# ------------- Verify button (both modes) -------------
 async def verify_callback(update: Update, context):
     q = update.callback_query; await q.answer()
     try:
@@ -820,7 +830,7 @@ async def verify_callback(update: Update, context):
     except Exception as e:
         logger.debug(f"verify_callback error: {e}")
 
-# -------- PTB + Starlette --------
+# ------------- PTB + Starlette -------------
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
     ChatJoinRequestHandler, filters, AIORateLimiter, Defaults
@@ -838,24 +848,23 @@ builder = (
     .updater(None)
     .defaults(Defaults(block=False))
 )
-
 try:
     builder = builder.rate_limiter(AIORateLimiter())
 except Exception as e:
     logger.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
-
 application = builder.build()
 bot_for_update = application.bot
 
 # Global error logger
 async def on_error(update: object, context):
     logger.error("Handler error", exc_info=context.error)
-
 application.add_error_handler(on_error)
 
 # ---- Handlers ----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
+
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
+
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
 
 application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
@@ -942,10 +951,8 @@ async def main():
     logger.info(f"Starting Uvicorn on 0.0.0.0:{port}")
     config = uvicorn.Config(app=app, host="0.0.0.0", port=port, workers=1, log_level="info")
     server = uvicorn.Server(config)
-
     await application.initialize()
     await application.start()
-
     global BOT_USERNAME
     try:
         me = await application.bot.get_me()
@@ -953,7 +960,6 @@ async def main():
         logger.info(f"BOT_USERNAME resolved: {BOT_USERNAME}")
     except Exception as e:
         logger.warning(f"Failed to resolve BOT_USERNAME: {e}")
-
     try:
         if WEBHOOK_URL:
             if secret_is_valid(WEBHOOK_SECRET):
@@ -973,9 +979,7 @@ async def main():
 
     await set_my_commands()
     await server.serve()
-
     await application.stop()
     await application.shutdown()
 
 if __name__ == "__main__":
-    asyncio.run(main())
