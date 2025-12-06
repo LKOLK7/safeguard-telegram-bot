@@ -681,11 +681,11 @@ async def handle_join_request(update: Update, context):
     )
     await notify_admins(context, admin_text)
 
-# ------------- VirusTotal file scanning (updated output with Top 3 engines) -------------
+# ------------- VirusTotal file scanning (updated output with configurable Top 3 engines) -------------
 def _normalize(s: str) -> str:
     return re.sub(r"[\s_\-]+", "", (s or "")).lower()
 
-def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, str]:
+def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, Optional[str]]:
     """
     Find the best matching engine name in VirusTotal 'results' for target_engine.
     Returns (category, result) where category ∈ {malicious, suspicious, harmless, undetected, ...},
@@ -711,12 +711,14 @@ def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, str]:
     if best_key is None:
         return ("undetected", None)
     det = results.get(best_key, {}) or {}
-    return (det.get("category") or "undetected", det.get("result"))
+    # VT sometimes uses 'harmless' or 'undetected' for clean; normalize to 'undetected' for display logic
+    category = det.get("category") or "undetected"
+    result = det.get("result")
+    return (category, result)
 
 def _format_engine_line(rank: int, engine_name: str, category: str, result: Optional[str]) -> str:
     """
-    Returns human-friendly line: '- Top N: <status>'
-    status is 'Detected (<signature>)' if malicious/suspicious, else 'Clean'
+    Returns human-friendly line: '- Top N: <engine> – Clean/Detected'
     """
     detected = (category in ("malicious", "suspicious"))
     status = f"Detected ({result})" if detected and result else ("Detected" if detected else "Clean")
@@ -727,7 +729,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
     Uploads the file to VirusTotal, waits for analysis completion, then reports:
     - File name
     - Overall stats
-    - Virus Engines (Top 1–Top 3): Clean or Detected
+    - Virus Engines (Top 1–Top 3): Clean or Detected (signature)
     """
     if requests is None:
         await progress_msg.edit_text("❌ 'requests' not installed. Add it to requirements.txt and redeploy."); return
@@ -996,7 +998,7 @@ async def main():
         if WEBHOOK_URL:
             if secret_is_valid(WEBHOOK_SECRET):
                 await application.bot.set_webhook(
-                    url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET,
+                    url=WEBHOOK_URL, secret_token=WEBHOOK_SECREТ,
                     allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
                 )
             else:
