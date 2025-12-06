@@ -1,19 +1,22 @@
 
 #!/usr/bin/env python
-import os, re, sys, random, logging, asyncio, string, base64, json
+import os, re, sys, random, logging, asyncio, string, base64, json, unicodedata
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from urllib.parse import urlparse
+
 # Optional dependency for external APIs
 try:
     import requests
 except ImportError:
     requests = None
+
 from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.helpers import escape_markdown
 import telegram
+
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
@@ -86,55 +89,106 @@ TOP_ENGINES = (TOP_ENGINES or DEFAULT_TOP_ENGINES)[:3]
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# Link regex (broader)
-URL_REGEX = re.compile(r"(https?://\S+|www\.\S+|t\.me/\S+|telegram\.me/\S+|@\w+)", re.IGNORECASE)
+# ------------- Defang / Deobfuscation + URL/Domain extraction -------------
 
-def contains_link(text: str) -> bool:
-    return bool(URL_REGEX.search(text or ""))
+ZERO_WIDTH_PATTERN = re.compile(
+    r"[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]"
+)
 
-def secret_is_valid(token: str) -> bool:
-    return bool(re.match(r'^[A-Za-z0-9_\-]{1,256}$', token))
+DEFANG_REPLACEMENTS = [
+    (re.compile(r"hxxps", re.I), "https"),
+    (re.compile(r"hxxp", re.I), "http"),
+    (re.compile(r"https\[\s*:\s*\]", re.I), "https:"),
+    (re.compile(r"http\[\s*:\s*\]", re.I), "http:"),
+    (re.compile(r"\[\s*:\s*\]//"), "://"),
+    (re.compile(r"\(\s*:\s*\)//"), "://"),
+    (re.compile(r"[:]\s*//"), "://"),
+    (re.compile(r"\[\.\]", re.I), "."),
+    (re.compile(r"\(\.\)", re.I), "."),
+    (re.compile(r"\{\.\}", re.I), "."),
+    (re.compile(r"\s+\.\s+"), "."),
+    # common obfuscations of dot and at
+    (re.compile(r"\s*\(\s*dot\s*\)\s*", re.I), "."),
+    (re.compile(r"\s*\[\s*dot\s*\]\s*", re.I), "."),
+    (re.compile(r"\s*{\s*dot\s*}\s*", re.I), "."),
+    (re.compile(r"\s*\(\s*at\s*\)\s*", re.I), "@"),
+    (re.compile(r"\s*\[\s*at\s*\]\s*", re.I), "@"),
+    # remove spaces between domain tokens like 'g i t h u b . com'
+    (re.compile(r"(?i)\b([a-z0-9])\s+(?=[a-z0-9])"), r"\1"),
+]
 
-def gen_token(length: int = 24) -> str:
-    alphabet = string.ascii_letters + string.digits + "_-"
-    return "".join(random.choice(alphabet) for _ in range(length))
+# detect domains even without scheme, including t.me/ telegram.me/ etc.
+DOMAIN_REGEX = re.compile(
+    r"""
+    (?<![\w])                                  # not preceded by word char
+    (                                          # group domain
+      (?:[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9omain
+      |(?:t\.me|telegram\.me)                  # telegram short domains
+      |localhost
+    )
+    (?:[:]\d{2,5})?                            # optional port
+    (?:/[^\s]+)?                               # optional path
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
-# ------------- Utilities -------------
-def extract_urls(text: str) -> List[str]:
-    if not text: return []
-    candidates = re.findall(r"https?://\S+|www\.\S+", text, flags=re.IGNORECASE)
-    urls = []
-    for u in candidates:
-        if u.lower().startswith("www."): u = "http://" + u
-        u = u.rstrip(").,;!?'\"")
-        urls.append(u)
-    return urls[:20]
+URL_WITH_SCHEME_REGEX = re.compile(
+    r"""
+    (?i)
+    \b
+    (?:https?|ftp)://
+    [^\s<>"]+
+    """,
+    re.VERBOSE,
+)
 
-def extract_ips(text: str, urls: List[str]) -> List[str]:
-    ips = []
-    ips += re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", text or "")
-    for u in urls:
-        try:
-            host = urlparse(u).hostname
-            if host and re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", host):
-                ips.append(host)
-        except Exception: pass
-    out = []
-    for ip in ips:
-        parts = ip.split(".")
-        if len(parts)==4 and all(p.isdigit() and 0<=int(p)<=255 for p in parts):
-            out.append(ip)
-    return list(dict.fromkeys(out))[:20]
+def strip_zero_width(text: str) -> str:
+    return ZERO_WIDTH_PATTERN.sub("", text or "")
 
-def _fmt_username(u: Optional[str]) -> str:
-    return f"@{u}" if u else "-"
+def deobfuscate_text(text: str) -> str:
+    t = strip_zero_width(text)
+    for pat, repl in DEFANG_REPLACEMENTS:
+        t = pat.sub(repl, t)
+    # collapse excessive whitespace
+    t = re.sub(r"\s{2,}", " ", t)
+    return t
 
-def username_change_alert(user_id: int, current_username: Optional[str]) -> str:
-    last = SESSION_USERNAMES.get(user_id)
-    SESSION_USERNAMES[user_id] = current_username
-    if last and last != current_username:
-        return f"• username changed: {_fmt_username(last)} → {_fmt_username(current_username)}"
-    return f"• username: {_fmt_username(current_username)}"
+def extract_urls_and_domains(text: str) -> List[str]:
+    """
+    Returns normalized URLs (with scheme). Converts bare domains to http://domain.
+    Handles defanged links and common obfuscations to prevent bypass.
+    """
+    if not text:
+        return []
+    t = deobfuscate_text(text)
+
+    urls = set()
+
+    # URLs that already have a scheme
+    for m in URL_WITH_SCHEME_REGEX.finditer(t):
+        u = m.group(0).rstrip(").,;!?'\"")
+        urls.add(u)
+
+    # Bare domains (no scheme) -> http://domain...
+    for m in DOMAIN_REGEX.finditer(t):
+        raw = m.group(0).rstrip(").,;!?'\"")
+        # If the raw already starts with a scheme, skip (already captured)
+        if not re.match(r"(?i)^(?:https?|ftp)://", raw):
+            u = "http://" + raw
+        else:
+            u = raw
+        urls.add(u)
+
+    # Special handling for @username (telegram links)
+    for m in re.finditer(r"(?i)@\w{5,}", t):
+        username = m.group(0)[1:]
+        urls.add(f"https://t.me/{username}")
+
+    # Limit to reasonable count
+    normalized = list(urls)
+    # sanitize trailing punctuation again
+    normalized = [u.rstrip(").,;!?'\"") for u in normalized]
+    return normalized[:20]
 
 # ------------- External checks -------------
 def vt_url_id(url: str) -> str:
@@ -528,12 +582,15 @@ async def moderate(update: Update, context):
     user = msg.from_user
     chat_id = update.effective_chat.id
     text = (msg.text or msg.caption or "")
+
     # Track username (session-only)
     try:
         SESSION_USERNAMES[user.id] = user.username
-    except Exception: pass
+    except Exception:
+        pass
 
-    if is_admin(user.id): return
+    if is_admin(user.id):
+        return
 
     # Flood control
     if record_user_message(chat_id, user.id) > FLOOD_MAX_MSG:
@@ -566,18 +623,17 @@ async def moderate(update: Update, context):
             await context.bot.send_message(chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.")
         return
 
-    urls = extract_urls(text)
-    ips = extract_ips(text, urls)
+    # Robust URL/domain extraction (prevents bypass)
+    urls = extract_urls_and_domains(text)
 
-    # Link reputation (GSB + VT)
+    # Link reputation & blocking
     if urls:
-        # Existing policy blocks links
         if BLOCK_LINKS:
             await delete_message_safe(update, context)
             await context.bot.send_message(chat_id, "🔗 Links are restricted here. If it’s class‑related, ask an admin.")
             add_warning(chat_id, user.id)
 
-        # Risk checks
+        # Risk checks (only check the first normalized URL for speed; can expand)
         gsb_bad, gsb_detail = check_google_safebrowsing(urls)
         vt_bad, vt_detail = False, ""
         if urls:
@@ -592,11 +648,32 @@ async def moderate(update: Update, context):
             return
 
     # IP reputation (AbuseIPDB)
+    # Extract IPs from the deobfuscated text + URLs
+    def extract_ips(text2: str, url_list: List[str]) -> List[str]:
+        ips = []
+        t2 = deobfuscate_text(text2)
+        ips += re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", t2 or "")
+        for u in url_list:
+            try:
+                host = urlparse(u).hostname
+                if host and re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", host):
+                    ips.append(host)
+            except Exception:
+                pass
+        out = []
+        for ip in ips:
+            parts = ip.split(".")
+            if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+                out.append(ip)
+        return list(dict.fromkeys(out))[:20]
+
+    ips = extract_ips(text, urls)
     if ips and ABUSEIPDB_API_KEY:
         bad_hits = []
         for ip in ips[:5]:
             bad, detail, score = check_abuseipdb_ip(ip)
-            if bad: bad_hits.append((ip, score, detail))
+            if bad:
+                bad_hits.append((ip, score, detail))
         if bad_hits:
             worst = max(bad_hits, key=lambda x: x[1])
             reason = f"IP reputation bad: {worst[0]} (confidence={worst[1]}) via AbuseIPDB"
@@ -711,7 +788,6 @@ def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, Optiona
     if best_key is None:
         return ("undetected", None)
     det = results.get(best_key, {}) or {}
-    # VT sometimes uses 'harmless' or 'undetected' for clean; normalize to 'undetected' for display logic
     category = det.get("category") or "undetected"
     result = det.get("result")
     return (category, result)
@@ -728,7 +804,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
     """
     Uploads the file to VirusTotal, waits for analysis completion, then reports:
     - File name
-    - Overall stats
+    - Summary (Malicious, Suspicious, Undetected X/Total)
     - Virus Engines (Top 1–Top 3): Clean or Detected (signature)
     """
     if requests is None:
@@ -761,6 +837,12 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
                 stats = attrs.get("stats", {}) or {}
                 results = attrs.get("results", {}) or {}
 
+                total_engines = len(results) if results else (
+                    int(stats.get("malicious", 0)) + int(stats.get("suspicious", 0)) +
+                    int(stats.get("undetected", 0)) + int(stats.get("harmless", 0))
+                )
+                undetected = int(stats.get("undetected", 0))
+
                 # Build Top 1–Top 3 engine lines
                 chosen = TOP_ENGINES[:3]
                 lines = []
@@ -775,8 +857,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
                     f"🔎 **Summary:**\n"
                     f"• 🛡 **Malicious:** `{stats.get('malicious', 0)}`\n"
                     f"• ⚠️ **Suspicious:** `{stats.get('suspicious', 0)}`\n"
-                    f"• ✅ **Harmless:** `{stats.get('harmless', 0)}`\n"
-                    f"• ❓ **Undetected:** `{stats.get('undetected', 0)}`\n\n"
+                    f"• ❓ **Undetected:** `{undetected}/{total_engines}`\n\n"
                     f"🧪 **Virus Engines:**\n"
                     f"{escape_markdown(engines_block, version=2)}\n\n"
                     f"Powered by CCU Teams of MPTC"
@@ -998,7 +1079,7 @@ async def main():
         if WEBHOOK_URL:
             if secret_is_valid(WEBHOOK_SECRET):
                 await application.bot.set_webhook(
-                    url=WEBHOOK_URL, secret_token=WEBHOOK_SECREТ,
+                    url=WEBHOOK_URL, secret_token=WEBHOOK_SECRET,
                     allowed_updates=Update.ALL_TYPES, drop_pending_updates=True
                 )
             else:
