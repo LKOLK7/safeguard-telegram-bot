@@ -50,7 +50,7 @@ PERSPECTIVE_ANALYZE = "https://commentanalyzer.googleapis.com/v1alpha1/comments:
 
 # Policies
 BAD_WORDS = {"idiot", "stupid", "fool"}
-BLOCK_LINKS = True
+BLOCK_LINKS = bool(int(os.getenv("BLOCK_LINKS", "0")))  # default OFF
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
@@ -486,7 +486,7 @@ async def togglelinks(update: Update, context):
         await enforce_admin_violation(update, context, "change bot settings (/togglelinks)"); return
     global BLOCK_LINKS
     BLOCK_LINKS = not BLOCK_LINKS
-    await context.bot.send_message(update.effective_chat.id, f"Link blocking is now {'ON' if BLOCK_LINKS else 'OFF'}.")
+    await context.bot.send_message(update.effective_chat.id, f"Link policy: {'BLOCK ALL LINKS' if BLOCK_LINKS else 'ALLOW LINKS (malicious ones are auto-removed)'}")
 
 # ------------- Gate -------------
 async def gate_unverified(update: Update, context):
@@ -545,25 +545,27 @@ async def moderate(update: Update, context):
         return
 
     urls = extract_urls_and_domains(text)
+if urls:
+    # Always screen links with GSB/VT
+    gsb_bad, gsb_detail = check_google_safebrowsing(urls)
+    vt_bad, vt_detail = check_virustotal_url(urls[0]) if urls else (False, "")
 
-    if urls:
-        if BLOCK_LINKS:
-            await delete_message_safe(update, context)
-            await context.bot.send_message(chat_id, "🔗 Links are restricted here. If it’s class‑related, ask an admin.")
-            add_warning(chat_id, user.id)
+    if gsb_bad or vt_bad:
+        reasons = []
+        if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
+        if vt_bad:  reasons.append(f"[VT] {vt_detail}")
+        severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
+        await auto_mitigate(update, context, user, chat_id, " ; ".join(reasons), severity=severity)
+        return
 
-        gsb_bad, gsb_detail = check_google_safebrowsing(urls)
-        vt_bad, vt_detail = False, ""
-        if urls:
-            vt_bad, vt_detail = check_virustotal_url(urls[0])
-        if gsb_bad or vt_bad:
-            reasons = []
-            if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
-            if vt_bad: reasons.append(f"[VT] {vt_detail}")
-            severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
-            await auto_mitigate(update, context, user, chat_id, " ; ".join(reasons), severity=severity)
-            return
+    # Optional classroom mode: block all links even if clean
+    if BLOCK_LINKS:
+        await delete_message_safe(update, context)
+        await context.bot.send_message(chat_id, "🔗 Links are restricted here. If it’s class‑related, ask an admin.")
+        add_warning(chat_id, user.id)
+        return
 
+    # IP reputation check
     ips = extract_ips(text, urls)
     if ips and ABUSEIPDB_API_KEY:
         bad_hits = []
@@ -576,7 +578,6 @@ async def moderate(update: Update, context):
             reason = f"IP reputation bad: {worst[0]} (confidence={worst[1]}) via AbuseIPDB"
             await auto_mitigate(update, context, user, chat_id, reason, severity="high")
             return
-
 # ------------- Join alert + CAPTCHA (Post-join) -------------
 async def welcome_verify(update: Update, context):
     chat_id = update.effective_chat.id
