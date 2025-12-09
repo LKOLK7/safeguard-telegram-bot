@@ -15,17 +15,16 @@ from telegram import (
 )
 from telegram.helpers import escape_markdown
 import telegram
-
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
 
-# ----------------- Logging -----------------
+# -------------- Logging --------------
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("safeguard-bot")
 
-# ----------------- Environment -----------------
+# -------------- Environment --------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
@@ -50,8 +49,8 @@ PERSPECTIVE_ANALYZE = "https://commentanalyzer.googleapis.com/v1alpha1/comments:
 
 # Policies
 BAD_WORDS = {"idiot", "stupid", "fool"}
-# Default: allow links; only remove if malicious/suspicious.
-BLOCK_LINKS = os.getenv("BLOCK_LINKS", "false").lower() == "true"
+# Default OFF: allow links but screen for malicious
+BLOCK_LINKS = os.getenv("BLOCK_LINKS", "0").lower() in ("1", "true", "yes")
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
@@ -90,7 +89,7 @@ TOP_ENGINES = (TOP_ENGINES or DEFAULT_TOP_ENGINES)[:3]
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
-# ----------------- Defang / Deobfuscation + URL/Domain extraction -----------------
+# -------------- Defang / Deobfuscation + URL/Domain extraction --------------
 ZERO_WIDTH_CHARS = r"[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]"
 ZERO_WIDTH_PATTERN = re.compile(ZERO_WIDTH_CHARS)
 
@@ -110,6 +109,7 @@ DEFANG_SUBS = [
     (re.compile(r"\s*\(\s*dot\s*\)\s*", re.I), "."),
     (re.compile(r"\s*\[\s*dot\s*\]\s*", re.I), "."),
     (re.compile(r"\s*\{\s*dot\s*\}\s*", re.I), "."),
+    (re.compile(r"(?i)\b([a-z0-9])\s+(?=[a-z0-9])"), r"\1"),
 ]
 
 def deobfuscate_text(text: str) -> str:
@@ -129,29 +129,24 @@ def extract_urls_and_domains(text: str) -> List[str]:
         return []
     t = deobfuscate_text(text)
     urls = set()
-
     for m in URL_WITH_SCHEME.finditer(t):
-        urls.add(m.group(0).rstrip(").,;!?\'\""))
-
+        urls.add(m.group(0).rstrip(").,;!?'\""))
     for m in DOMAIN_SIMPLE.finditer(t):
-        raw = m.group(0).rstrip(").,;!?\'\"")
+        raw = m.group(0).rstrip(").,;!?'\"")
         if not re.match(r"(?i)^(?:https?|ftp)://", raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-
     for m in TELEGRAM_DOMAIN.finditer(t):
-        raw = m.group(0).rstrip(").,;!?\'\"")
+        raw = m.group(0).rstrip(").,;!?'\"")
         if not raw.startswith("http"):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-
     for m in re.finditer(r"(?i)@\w{5,}", t):
         username = m.group(0)[1:]
         urls.add(f"https://t.me/{username}")
-
-    normalized = [u.rstrip(").,;!?\'\"") for u in urls]
+    normalized = [u.rstrip(").,;!?'\"") for u in urls]
     return normalized[:20]
 
 
@@ -176,7 +171,7 @@ def extract_ips(text: str, urls: List[str]) -> List[str]:
             uniq.append(ip); seen.add(ip)
     return uniq[:20]
 
-# ----------------- External checks -----------------
+# -------------- External checks --------------
 
 def vt_url_id(url: str) -> str:
     raw = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
@@ -184,8 +179,7 @@ def vt_url_id(url: str) -> str:
 
 
 def check_virustotal_url(url: str) -> Tuple[bool, str]:
-    if not VT_API_KEY or requests is None:
-        return (False, "VT disabled")
+    if not VT_API_KEY or requests is None: return (False, "VT disabled")
     headers = {"x-apikey": VT_API_KEY}
     try:
         uid = vt_url_id(url)
@@ -207,8 +201,7 @@ def check_virustotal_url(url: str) -> Tuple[bool, str]:
 
 
 def check_google_safebrowsing(urls: List[str]) -> Tuple[bool, str]:
-    if not GSB_API_KEY or requests is None or not urls:
-        return (False, "GSB disabled")
+    if not GSB_API_KEY or requests is None or not urls: return (False, "GSB disabled")
     payload = {
         "client": {"clientId": "safebrowsing_bot", "clientVersion": "1.0"},
         "threatInfo": {
@@ -232,8 +225,7 @@ def check_google_safebrowsing(urls: List[str]) -> Tuple[bool, str]:
 
 
 def check_abuseipdb_ip(ip: str) -> Tuple[bool, str, int]:
-    if not ABUSEIPDB_API_KEY or requests is None:
-        return (False, "AbuseIPDB disabled", 0)
+    if not ABUSEIPDB_API_KEY or requests is None: return (False, "AbuseIPDB disabled", 0)
     headers = {"Key": ABUSEIPDB_API_KEY, "Accept": "application/json"}
     params = {"ipAddress": ip, "maxAgeInDays": "90"}
     try:
@@ -248,11 +240,9 @@ def check_abuseipdb_ip(ip: str) -> Tuple[bool, str, int]:
     except Exception as e:
         return (False, f"AbuseIPDB error: {e}", 0)
 
-
 async def analyze_toxicity(text: str) -> Optional[dict]:
     global _last_perspective_call_ts
-    if not PERSPECTIVE_API_KEY or requests is None or not text:
-        return None
+    if not PERSPECTIVE_API_KEY or requests is None or not text: return None
     now = datetime.now().timestamp()
     if now - _last_perspective_call_ts < PERSPECTIVE_MIN_INTERVAL:
         return None
@@ -271,13 +261,12 @@ async def analyze_toxicity(text: str) -> Optional[dict]:
     except Exception:
         return None
 
-# ----------------- Helpers (async) -----------------
+# -------------- Helpers (async) --------------
 async def delete_message_safe(update: Update, context):
     try:
         await context.bot.delete_message(update.effective_chat.id, update.effective_message.message_id)
     except Exception as e:
         logger.warning(f"Delete failed: {e}")
-
 
 async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
     perms = ChatPermissions(
@@ -290,7 +279,6 @@ async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
     except Exception as e:
         logger.warning(f"Restrict failed: {e}")
 
-
 async def unrestrict_user(chat_id: int, user_id: int, context):
     perms = ChatPermissions(
         can_send_messages=True, can_send_polls=True, can_send_other_messages=True,
@@ -302,12 +290,10 @@ async def unrestrict_user(chat_id: int, user_id: int, context):
     except Exception as e:
         logger.warning(f"Unrestrict failed: {e}")
 
-
 def add_warning(chat_id: int, user_id: int) -> int:
     key = (chat_id, user_id)
     USER_WARNINGS[key] = USER_WARNINGS.get(key, 0) + 1
     return USER_WARNINGS[key]
-
 
 def record_user_message(chat_id: int, user_id: int) -> int:
     key = (chat_id, user_id)
@@ -317,7 +303,6 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     USER_MSG_TIMES[key] = [t for t in times if now - t <= FLOOD_WINDOW_SEC]
     return len(USER_MSG_TIMES[key])
 
-
 async def notify_admins(context, text: str, parse_mode=None):
     for admin_id in ADMIN_IDS:
         try:
@@ -325,7 +310,7 @@ async def notify_admins(context, text: str, parse_mode=None):
         except Exception:
             pass
 
-# ----------------- NEW: Custom welcome message builder -----------------
+# -------------- NEW: Custom welcome message builder --------------
 
 def build_welcome_message(name: str) -> str:
     return (
@@ -342,7 +327,7 @@ def build_welcome_message(name: str) -> str:
         "✅ Developed by CCU Teams of MPTC."
     )
 
-# ----------------- Incident response -----------------
+# -------------- Incident response --------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
     if severity in ("medium","high","critical"):
         await delete_message_safe(update, context)
@@ -350,19 +335,30 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
     if severity == "low":
         await context.bot.send_message(chat_id, f"⚠️ {reason}. Please avoid posting risky content, @{user.username or user.first_name}.")
     elif severity == "medium":
-        await context.bot.send_message(chat_id, f"🛑 {reason}. Message removed. Warning ({total}/{WARN_LIMIT}).")
+        m = await context.bot.send_message(chat_id, f"🛑 {reason}. Message removed. Warning ({total}/{WARN_LIMIT}).")
+        # auto-delete mitigation notice after 60s
+        asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
     elif severity == "high":
-        await context.bot.send_message(chat_id, f"🚫 {reason}. You are temporarily muted for {MUTE_SECONDS}s.")
+        m = await context.bot.send_message(chat_id, f"🚫 {reason}. You are temporarily muted for {MUTE_SECONDS}s.")
+        asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
     else:
-        await context.bot.send_message(chat_id, f"⛔ {reason}. You are muted for {MUTE_SECONDS*3}s.")
+        m = await context.bot.send_message(chat_id, f"⛔ {reason}. You are muted for {MUTE_SECONDS*3}s.")
+        asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS*3))
     try:
         await notify_admins(context, f"🔎 Security action\n• Chat: {chat_id}\n• UID: {user.id}\n• Reason: {reason}\n• Severity: {severity}")
     except Exception:
         pass
 
-# ----------------- Diagnostics -----------------
+async def _auto_delete_message(context, chat_id: int, message_id: int, delay: int = 60):
+    try:
+        await asyncio.sleep(delay)
+        await context.bot.delete_message(chat_id, message_id)
+    except Exception as e:
+        logger.debug(f"auto-delete failed: {e}")
+
+# -------------- Diagnostics --------------
 async def log_all_updates(update: Update, context):
     types = []
     if update.message: types.append("message")
@@ -381,7 +377,7 @@ async def log_all_updates(update: Update, context):
     if update.chat_join_request: types.append("chat_join_request")
     logger.info(f"UPDATE TYPES: {types}")
 
-# ----------------- Commands -----------------
+# -------------- Commands --------------
 async def cmd_start(update: Update, context):
     payload = None
     if update.message and update.message.text:
@@ -403,10 +399,8 @@ async def cmd_start(update: Update, context):
     name = f"{update.effective_user.first_name or ''} {update.effective_user.last_name or ''}".strip() or (f"@{update.effective_user.username}" if update.effective_user.username else str(update.effective_user.id))
     await context.bot.send_message(update.effective_chat.id, build_welcome_message(name))
 
-
 async def cmd_rules(update: Update, context):
     await context.bot.send_message(update.effective_chat.id, "Group rules:\n• Be respectful.\n• No profanity or harassment.\n• Avoid spam & unsolicited ads.\n• External links only when relevant.\n• Follow lecturer’s guidance.")
-
 
 async def cmd_report(update: Update, context):
     reason = " ".join(context.args) if getattr(context, "args", None) else "(no reason provided)"
@@ -416,7 +410,6 @@ async def cmd_report(update: Update, context):
             await context.bot.send_message(admin_id, f"[REPORT] Chat {update.effective_chat.id} from @{update.effective_user.username or update.effective_user.id}: {reason}")
         except Exception:
             pass
-
 
 async def cmd_warnings(update: Update, context):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
@@ -428,7 +421,6 @@ async def cmd_ping(update: Update, context):
         await enforce_admin_violation(update, context, "use admin-only commands (/ping)")
         return
     await context.bot.send_message(update.effective_chat.id, "🏓 pong")
-
 
 async def cmd_diagnose(update: Update, context):
     if not is_admin(update.effective_user.id):
@@ -451,7 +443,6 @@ async def cmd_diagnose(update: Update, context):
     except Exception as e:
         await context.bot.send_message(chat_id, f"Diagnose error: {e}")
 
-
 async def cmd_function(update: Update, context):
     text = (
         "🛠 **Safeguard Bot Functions**\n\n"
@@ -468,18 +459,19 @@ async def cmd_function(update: Update, context):
     )
     await context.bot.send_message(update.effective_chat.id, text, parse_mode="Markdown")
 
-# ----------------- Admin policy controls -----------------
+# -------------- Admin policy controls --------------
 async def enforce_admin_violation(update: Update, context, action_label: str):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
     await delete_message_safe(update, context)
     total = add_warning(chat_id, user_id)
     if total >= WARN_LIMIT:
-        await context.bot.send_message(chat_id, f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s.")
+        m = await context.bot.send_message(chat_id, f"🚫 You are not allowed to {action_label}. Muted for {MUTE_SECONDS}s.")
+        asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
         await restrict_user(chat_id, user_id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
     else:
-        await context.bot.send_message(chat_id, f"⚠️ You are not allowed to {action_label}. Warning ({total}/{WARN_LIMIT}).\nFurther violations may result in a temporary mute.")
-
+        m = await context.bot.send_message(chat_id, f"⚠️ You are not allowed to {action_label}. Warning ({total}/{WARN_LIMIT}).\nFurther violations may result in a temporary mute.")
+        asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
 
 async def addbadword(update: Update, context):
     if not is_admin(update.effective_user.id):
@@ -489,7 +481,6 @@ async def addbadword(update: Update, context):
     for w in context.args:
         BAD_WORDS.add(w.lower())
     await context.bot.send_message(update.effective_chat.id, f"Added: {', '.join(context.args)}")
-
 
 async def removebadword(update: Update, context):
     if not is_admin(update.effective_user.id):
@@ -503,18 +494,14 @@ async def removebadword(update: Update, context):
             BAD_WORDS.remove(wl); removed.append(w)
     await context.bot.send_message(update.effective_chat.id, f"Removed: {', '.join(removed) if removed else '(none)'}")
 
-
 async def togglelinks(update: Update, context):
     if not is_admin(update.effective_user.id):
         await enforce_admin_violation(update, context, "change bot settings (/togglelinks)"); return
     global BLOCK_LINKS
     BLOCK_LINKS = not BLOCK_LINKS
-    await context.bot.send_message(
-        update.effective_chat.id,
-        f"Link policy: {'BLOCK ALL LINKS' if BLOCK_LINKS else 'ALLOW LINKS (malicious ones are auto-removed)'}."
-    )
+    await context.bot.send_message(update.effective_chat.id, f"Link policy: {'BLOCK ALL LINKS' if BLOCK_LINKS else 'ALLOW LINKS (malicious ones are auto-removed)'}.")
 
-# ----------------- Gate -----------------
+# -------------- Gate --------------
 async def gate_unverified(update: Update, context):
     chat = update.effective_chat
     user = update.effective_user
@@ -527,7 +514,7 @@ async def gate_unverified(update: Update, context):
         except Exception:
             pass
 
-# ----------------- Moderation -----------------
+# -------------- Moderation --------------
 async def moderate(update: Update, context):
     msg = update.effective_message
     user = msg.from_user
@@ -538,18 +525,16 @@ async def moderate(update: Update, context):
     except Exception:
         pass
 
-    # Admins are exempt
     if is_admin(user.id):
         return
 
-    # Flood control
     if record_user_message(chat_id, user.id) > FLOOD_MAX_MSG:
         await delete_message_safe(update, context)
-        await context.bot.send_message(chat_id, f"⌛ Slow down, @{user.username or user.first_name} (muted {MUTE_SECONDS}s).")
+        m = await context.bot.send_message(chat_id, f"⌛ Slow down, @{user.username or user.first_name} (muted {MUTE_SECONDS}s).")
+        asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
         return
 
-    # Toxicity screening
     if PERSPECTIVE_API_KEY and len(text) >= 10:
         scores = await analyze_toxicity(text)
         if scores:
@@ -562,18 +547,19 @@ async def moderate(update: Update, context):
                 await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
                 return
 
-    # Offensive words
     if any(bad in text.lower() for bad in BAD_WORDS):
         await delete_message_safe(update, context)
         total = add_warning(chat_id, user.id)
         if total >= WARN_LIMIT:
-            await context.bot.send_message(chat_id, f"🚫 Keep it civil. Muted for {MUTE_SECONDS}s.")
+            m = await context.bot.send_message(chat_id, f"🚫 Keep it civil. Muted for {MUTE_SECONDS}s.")
+            asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
             await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
         else:
-            await context.bot.send_message(chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.")
+            m = await context.bot.send_message(chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.")
+            asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
         return
 
-    # --- URL/IP moderation logic: allow links but screen for malicious ---
+    # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
     if urls:
         # 1) Always screen links with GSB/VT
@@ -591,14 +577,15 @@ async def moderate(update: Update, context):
         # 2) Optional classroom mode: blanket block even if clean
         if BLOCK_LINKS:
             await delete_message_safe(update, context)
-            await context.bot.send_message(
+            m = await context.bot.send_message(
                 chat_id,
                 "🔗 Links are restricted here. If it’s class‑related, ask an admin."
             )
+            asyncio.create_task(_auto_delete_message(context, chat_id, m.message_id, delay=MUTE_SECONDS))
             add_warning(chat_id, user.id)
             return
 
-        # 3) IP reputation checks (AbuseIPDB)
+        # 3) IP reputation check still applies (AbuseIPDB)
         ips = extract_ips(text, urls)
         if ips and ABUSEIPDB_API_KEY:
             bad_hits = []
@@ -612,7 +599,7 @@ async def moderate(update: Update, context):
                 await auto_mitigate(update, context, user, chat_id, reason, severity="high")
                 return
 
-# ----------------- Join alert + CAPTCHA (Post-join) -----------------
+# -------------- Join alert + CAPTCHA (Post-join) --------------
 async def welcome_verify(update: Update, context):
     chat_id = update.effective_chat.id
     for new_member in update.message.new_chat_members:
@@ -626,7 +613,7 @@ async def welcome_verify(update: Update, context):
         await context.bot.send_message(chat_id, f"📣 NEW MEMBER ALERT\nPlease verify: pick **{correct}** to unlock chatting.\nUID: `{new_member.id}`", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
         await context.bot.send_message(chat_id, build_welcome_message(name))
 
-# ----------------- Join Request (Pre-join verification) -----------------
+# -------------- Join Request (Pre-join verification) --------------
 async def handle_join_request(update: Update, context):
     req = update.chat_join_request
     chat_id = req.chat.id
@@ -640,11 +627,10 @@ async def handle_join_request(update: Update, context):
     except Exception:
         pass
 
-# ----------------- VirusTotal file scanning (summary) -----------------
+# -------------- VirusTotal file scanning (with auto-delete of result after 60s) --------------
 
 def _normalize(s: str) -> str:
     return re.sub(r"[\s_\-]+", "", (s or "")).lower()
-
 
 def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, Optional[str]]:
     if not results:
@@ -672,8 +658,7 @@ def _format_engine_line(rank: int, engine_name: str, category: str, result: Opti
     status = f"Detected ({result})" if detected and result else ("Detected" if detected else "Clean")
     return f"- Top {rank}: {engine_name} – {status}"
 
-
-async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
+async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, context, chat_id: int):
     if requests is None:
         await progress_msg.edit_text("❌ 'requests' not installed. Add it to requirements.txt and redeploy."); return
     if not VT_API_KEY:
@@ -691,6 +676,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
 
     idx, prev, attempts, max_attempts = 0, None, 0, 120
     headers = {"x-apikey": VT_API_KEY}
+    summary_message_id = None
     while attempts < max_attempts:
         await asyncio.sleep(5)
         try:
@@ -734,6 +720,9 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
                     f"🔔 Powered by CCU Teams of MPTC"
                 )
                 await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
+                # schedule auto-delete of the scan result after 60 seconds
+                summary_message_id = progress_msg.message_id
+                asyncio.create_task(_auto_delete_message(context, chat_id, summary_message_id, delay=60))
                 try:
                     os.remove(file_path)
                 except Exception as e:
@@ -747,11 +736,8 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str):
         except Exception as e:
             logger.error(f"VT status error: {e}"); attempts += 1
     await progress_msg.edit_text("⚠️ Scan taking too long. Please check manually on VirusTotal.")
-    try:
-        os.remove(file_path)
-    except Exception as e:
-        logger.error(f"Delete temp after timeout failed: {e}")
-
+    try: os.remove(file_path)
+    except Exception as e: logger.error(f"Delete temp after timeout failed: {e}")
 
 async def scan_document(update: Update, context):
     doc = update.message.document
@@ -759,8 +745,7 @@ async def scan_document(update: Update, context):
     path = await file.download_to_drive()
     display_name = doc.file_name or os.path.basename(path)
     progress = await context.bot.send_message(update.effective_chat.id, "⏳ Uploading file to VirusTotal and starting scan...")
-    await vt_scan_and_report(path, progress, display_name)
-
+    await vt_scan_and_report(path, progress, display_name, context, update.effective_chat.id)
 
 async def scan_photo(update: Update, context):
     photo = update.message.photo[-1]
@@ -768,9 +753,9 @@ async def scan_photo(update: Update, context):
     path = await file.download_to_drive()
     display_name = os.path.basename(path)
     progress = await context.bot.send_message(update.effective_chat.id, "⏳ Uploading image to VirusTotal and starting scan...")
-    await vt_scan_and_report(path, progress, display_name)
+    await vt_scan_and_report(path, progress, display_name, context, update.effective_chat.id)
 
-# ----------------- Verify button (both modes) -----------------
+# -------------- Verify button (both modes) --------------
 async def verify_callback(update: Update, context):
     q = update.callback_query; await q.answer()
     try:
@@ -820,7 +805,7 @@ async def verify_callback(update: Update, context):
     except Exception as e:
         logger.debug(f"verify_callback error: {e}")
 
-# ----------------- PTB + Starlette -----------------
+# -------------- PTB + Starlette --------------
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
     ChatJoinRequestHandler, filters, AIORateLimiter, Defaults
@@ -833,28 +818,25 @@ builder = (
     .updater(None)
     .defaults(Defaults(block=False))
 )
-
 try:
     builder = builder.rate_limiter(AIORateLimiter())
 except Exception as e:
     logging.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
-
 application = builder.build()
+
 bot_for_update = application.bot
 
 # Global error logger
 async def on_error(update: object, context):
     logging.error("Handler error", exc_info=context.error)
-
 application.add_error_handler(on_error)
 
 # ---- Handlers ----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
 
-# Combine group/supergroup filters correctly
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
-
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
+
 application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
 application.add_handler(CommandHandler("rules", cmd_rules, block=False), group=1)
 application.add_handler(CommandHandler("report", cmd_report, block=False), group=1)
@@ -865,7 +847,6 @@ application.add_handler(CommandHandler("function", cmd_function, block=False), g
 application.add_handler(CommandHandler("ping", cmd_ping, block=False), group=1)
 application.add_handler(CommandHandler("diagnose", cmd_diagnose, block=False), group=1)
 
-# File scanning
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)
 application.add_handler(MessageHandler(filters.PHOTO, scan_photo, block=False), group=1)
 
@@ -873,10 +854,10 @@ application.add_handler(MessageHandler(filters.PHOTO, scan_photo, block=False), 
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify), group=1)
 application.add_handler(ChatJoinRequestHandler(handle_join_request), group=1)
 
-# Unified verification callback (fix regex pattern)
+# Unified verification callback
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^(verify:|verify_join:)"), group=1)
 
-# Moderation (text/caption excluding commands)
+# Moderation
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate), group=1)
 
 # ---- Command tap (optional log) ----
@@ -917,12 +898,6 @@ async def set_my_commands():
 async def healthz(request: Request): return JSONResponse({"status":"ok"})
 async def root(request: Request): return PlainTextResponse("OK", status_code=200)
 
-# Simple token generator for join requests
-
-def gen_token(length: int = 24) -> str:
-    alphabet = string.ascii_letters + string.digits
-    return ''.join(random.choice(alphabet) for _ in range(length))
-
 async def webhook(request: Request) -> Response:
     if WEBHOOK_SECRET and re.match(r'^[A-Za-z0-9_\-]{1,256}$', WEBHOOK_SECRET):
         if request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET:
@@ -938,6 +913,11 @@ routes = [
     Route(WEBHOOK_PATH, webhook, methods=["POST"])
 ]
 app = Starlette(routes=routes)
+
+# ---- Misc helpers ----
+def gen_token(length: int = 22) -> str:
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(random.choice(alphabet) for _ in range(length))
 
 # ---- Async main ----
 async def main():
@@ -976,7 +956,6 @@ async def main():
         logging.error(f"set_webhook failed: {e}")
 
     await set_my_commands()
-
     await server.serve()
 
     await application.stop()
