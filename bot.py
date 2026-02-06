@@ -25,7 +25,7 @@ from starlette.routing import Route
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("safeguard-bot")
 
-# ------------- Environment -------------
+# ------------- Environment (keep only secrets & deployment knobs) -------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
@@ -33,13 +33,13 @@ BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
 
-# API keys
+# API keys (optional but recommended)
 VT_API_KEY = os.getenv("VT_API_KEY", "")
 GSB_API_KEY = os.getenv("GSB_API_KEY", "")
 PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY", "")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
 
-# NEW: Vault + bot message cleanup controls
+# Vault & bot message cleanup controls (kept in env for operational flexibility)
 VAULT_CHANNEL_ID = int(os.getenv("VAULT_CHANNEL_ID", "0") or "0")   # e.g., -1001234567890
 AUTO_DELETE_BOT_MSGS = os.getenv("AUTO_DELETE_BOT_MSGS", "1").lower() in ("1", "true", "yes")
 BOT_MSG_TTL = int(os.getenv("BOT_MSG_TTL", "60"))  # seconds; used in groups for benign/info msgs
@@ -53,24 +53,34 @@ GSB_LOOKUP = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 ABUSEIPDB_CHECK = "https://api.abuseipdb.com/api/v2/check"
 PERSPECTIVE_ANALYZE = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
 
-# Policies
+# ------------- Fixed policy thresholds & defaults (moved from env into code) -------------
+# Group policy
 BAD_WORDS = {"idiot", "stupid", "fool"}
-
-# Default OFF: allow links but screen for malicious
-BLOCK_LINKS = os.getenv("BLOCK_LINKS", "0").lower() in ("1", "true", "yes")
+BLOCK_LINKS = False               # Default allow links but screen for malicious
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
 MUTE_SECONDS = 60
 
-# Risk thresholds (tune via env if desired)
-TOXICITY_THRESHOLD = float(os.getenv("TOXICITY_THRESHOLD", "0.85"))
-SEVERE_TOXICITY_THRESHOLD = float(os.getenv("SEVERE_TOXICITY_THRESHOLD", "0.75"))
-INSULT_THRESHOLD = float(os.getenv("INSULT_THRESHOLD", "0.85"))
-THREAT_THRESHOLD = float(os.getenv("THREAT_THRESHOLD", "0.60"))
-ABUSEIPDB_CONFIDENCE_MIN = int(os.getenv("ABUSEIPDB_CONFIDENCE_MIN", "75"))
+# Risk thresholds (hard-coded here; adjust in code if needed)
+TOXICITY_THRESHOLD = 0.85
+SEVERE_TOXICITY_THRESHOLD = 0.75
+INSULT_THRESHOLD = 0.85
+THREAT_THRESHOLD = 0.60
+ABUSEIPDB_CONFIDENCE_MIN = 75
 
-# State (in-memory only; no persistence)
+# Perspective throttling (per bot; in seconds)
+PERSPECTIVE_MIN_INTERVAL = 1.0
+
+# VirusTotal summary engines
+ENGINES_FOR_PROGRESS = [
+    "Kaspersky","Avast","BitDefender","ESET-NOD32","Microsoft","Sophos","TrendMicro",
+    "McAfee","DrWeb","Fortinet","ClamAV","Paloalto","Malwarebytes","VIPRE"
+]
+DEFAULT_TOP_ENGINES = ["Microsoft", "Kaspersky", "BitDefender"]
+TOP_ENGINES = DEFAULT_TOP_ENGINES[:]  # fixed list; change here if you want different top engines
+
+# ---- Runtime state (in-memory only; no persistence) ----
 PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
 PENDING_JOIN = {}     # token -> {"chat_id": ..., "user_id": ...}
 USER_WARNINGS = {}    # (chat_id, user_id) -> count
@@ -81,16 +91,6 @@ SESSION_USERNAMES: dict[int, Optional[str]] = {}
 
 # Simple throttle for Perspective (~1 QPS default)
 _last_perspective_call_ts = 0.0
-PERSPECTIVE_MIN_INTERVAL = float(os.getenv("PERSPECTIVE_MIN_INTERVAL", "1.0"))
-
-ENGINES_FOR_PROGRESS = [
-    "Kaspersky","Avast","BitDefender","ESET-NOD32","Microsoft","Sophos","TrendMicro",
-    "McAfee","DrWeb","Fortinet","ClamAV","Paloalto","Malwarebytes","VIPRE"
-]
-# ---- Preferred engines for summary (Top 1–Top 3) ----
-DEFAULT_TOP_ENGINES = ["Microsoft", "Kaspersky", "BitDefender"]
-TOP_ENGINES = [x.strip() for x in os.getenv("TOP_ENGINES", ",".join(DEFAULT_TOP_ENGINES)).split(",") if x.strip()]
-TOP_ENGINES = (TOP_ENGINES or DEFAULT_TOP_ENGINES)[:3]
 
 
 def is_admin(user_id: int) -> bool:
@@ -341,7 +341,7 @@ async def send_ephemeral(context, chat_id: int, text: str, *, parse_mode=None, r
     return m
 
 
-# ------------- NEW: Custom welcome message builder -------------
+# ------------- Custom welcome message builder -------------
 def build_welcome_message(name: str) -> str:
     return (
         f"👋 Welcome {name}! This bot helps keep our community safe and secure.\n\n"
@@ -527,7 +527,7 @@ async def togglelinks(update: Update, context):
         await enforce_admin_violation(update, context, "change bot settings (/togglelinks)"); return
     global BLOCK_LINKS
     BLOCK_LINKS = not BLOCK_LINKS
-    await send_ephemeral(update._bot, update.effective_chat.id, f"Link policy: {'BLOCK ALL LINKS' if BLOCK_LINKS else 'ALLOW LINKS (malicious ones are auto-removed)'}.")
+    await send_ephemeral(context, update.effective_chat.id, f"Link policy: {'BLOCK ALL LINKS' if BLOCK_LINKS else 'ALLOW LINKS (malicious ones are auto-removed)'}.")
 
 
 # ------------- Gate -------------
@@ -652,6 +652,7 @@ async def handle_join_request(update: Update, context):
     user = req.from_user
     token = gen_token()
     PENDING_JOIN[token] = {"chat_id": chat_id, "user_id": user.id}
+    global BOT_USERNAME
     deep_link = f"https://t.me/{BOT_USERNAME}?start=join-{token}" if BOT_USERNAME else None
     UNVERIFIED.add((chat_id, user.id))
     try:
@@ -709,7 +710,6 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
     idx, prev, attempts, max_attempts = 0, None, 0, 120
     headers = {"x-apikey": VT_API_KEY}
     summary_message_id = None
-    malicious_found = False
 
     while attempts < max_attempts:
         await asyncio.sleep(5)
@@ -721,16 +721,13 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                 stats = attrs.get("stats", {}) or {}
                 results = attrs.get("results", {}) or {}
 
-                # Counts
                 mal = int(stats.get("malicious", 0))
                 sus = int(stats.get("suspicious", 0))
                 und = int(stats.get("undetected", 0))
                 har = int(stats.get("harmless", 0))
 
-                # Undetected denominator (exclude harmless)
                 total_for_und = (mal + sus + und) if (mal + sus + und) > 0 else und
 
-                # Build Top 1–Top 3 engine lines
                 chosen = TOP_ENGINES[:3]
                 lines = []
                 for i, eng in enumerate(chosen, start=1):
@@ -738,22 +735,8 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                     lines.append(_format_engine_line(i, eng, cat, res))
                 engines_block = "\n".join(lines)
 
-                # Summary rendering
-                if (mal > 0) or (sus > 0) or (har > 0):
-                    summary_body = (
-                        f"• 🛡 **Malicious:** `{mal}`\n"
-                        f"• ⚠️ **Suspicious:** `{sus}`\n"
-                        f"• ✅ **Harmless:** `{har}`\n"
-                        f"• ❓ **Undetected:** `{und}/{total_for_und}`\n"
-                    )
-                else:
-                    summary_body = f"• ❓ **Undetected:** `{und}/{total_for_und}`\n"
-
-                # Malicious / suspicious handling
-                malicious_found = (mal > 0) or (sus > 0)
-
-                if malicious_found:
-                    # 1) Forward to vault if configured, then delete original group message
+                if (mal > 0) or (sus > 0):
+                    # Forward to vault (if configured), then delete original group message
                     try:
                         if VAULT_CHANNEL_ID:
                             await context.bot.forward_message(
@@ -769,7 +752,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                     except Exception as e:
                         logger.warning(f"Delete malicious src message failed: {e}")
 
-                    # 2) Post a persistent 'red/stylish' report (no auto-delete)
+                    # RED ALERT (persistent)
                     file_html = html.escape(display_name)
                     engines_html = html.escape(engines_block)
                     report_html = (
@@ -783,22 +766,23 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                     await progress_msg.edit_text(report_html, parse_mode="HTML", disable_web_page_preview=True)
 
                 else:
-                    # Clean/undetected -> keep as green summary and auto-delete after TTL (in groups)
+                    # Benign summary (auto-delete after TTL)
                     summary = (
                         f"✅ **Scan Complete!**\n\n"
                         f"📄 **File:** `{escape_markdown(display_name, version=2)}`\n\n"
                         f"🔎 **Summary:**\n"
-                        f"{summary_body}\n"
+                        f"• 🛡 **Malicious:** `{mal}`\n"
+                        f"• ⚠️ **Suspicious:** `{sus}`\n"
+                        f"• ✅ **Harmless:** `{har}`\n"
+                        f"• ❓ **Undetected:** `{und}/{total_for_und}`\n\n"
                         f"🧪 **Virus Engines:**\n"
                         f"{escape_markdown(engines_block, version=2)}\n\n"
                         f"🔔 Powered by CCU Teams of MPTC"
                     )
                     await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
                     summary_message_id = progress_msg.message_id
-                    # Auto-delete benign report in groups to reduce clutter
                     asyncio.create_task(_auto_delete_message(context, chat_id, summary_message_id, delay=BOT_MSG_TTL))
 
-                # Clean up local temp file
                 try:
                     os.remove(file_path)
                 except Exception as e:
