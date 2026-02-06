@@ -98,38 +98,38 @@ def is_admin(user_id: int) -> bool:
 
 
 # ------------- Defang / Deobfuscation + URL/Domain extraction -------------
-ZERO_WIDTH_CHARS = r"[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]"
+ZERO_WIDTH_CHARS = r'[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]'
 ZERO_WIDTH_PATTERN = re.compile(ZERO_WIDTH_CHARS)
 
 def strip_zero_width(text: str) -> str:
     return ZERO_WIDTH_PATTERN.sub("", text or "")
 
 DEFANG_SUBS = [
-    (re.compile(r"hxxps", re.I), "https"),
-    (re.compile(r"hxxp", re.I), "http"),
-    (re.compile(r"https\[\s*:\s*\]", re.I), "https:"),
-    (re.compile(r"http\[\s*:\s*\]", re.I), "http:"),
-    (re.compile(r"\[\s*:\s*\]//"), "://"),
-    (re.compile(r"[:\]\s*//"), "://"),
-    (re.compile(r"\[\.\]", re.I), "."),
-    (re.compile(r"\(\.\)", re.I), "."),
-    (re.compile(r"\{\.\}", re.I), "."),
-    (re.compile(r"\s*\(\s*dot\s*\)\s*", re.I), "."),
-    (re.compile(r"\s*\[\s*dot\s*\]\s*", re.I), "."),
-    (re.compile(r"\s*\{\s*dot\s*\}\s*", re.I), "."),
-    (re.compile(r"(?i)\b([a-z0-9])\s+(?=[a-z0-9])"), r"\1"),
+    (re.compile(r'hxxps', re.I), 'https'),
+    (re.compile(r'hxxp', re.I), 'http'),
+    (re.compile(r'https\[\s*:\s*\]', re.I), 'https:'),
+    (re.compile(r'http\[\s*:\s*\]', re.I), 'http:'),
+    (re.compile(r'\[\s*:\s*\]//'), '://'),
+    (re.compile(r'\[\.\]', re.I), '.'),
+    (re.compile(r'\(\.\)', re.I), '.'),
+    (re.compile(r'\{\.\}', re.I), '.'),
+    (re.compile(r'\s*\(\s*dot\s*\)\s*', re.I), '.'),
+    (re.compile(r'\s*\[\s*dot\s*\]\s*', re.I), '.'),
+    (re.compile(r'\s*\{\s*dot\s*\}\s*', re.I), '.'),
+    (re.compile(r'(?i)\b([a-z0-9])\s+(?=[a-z0-9])'), r'\1'),
 ]
 
 def deobfuscate_text(text: str) -> str:
     t = strip_zero_width(text)
     for pat, repl in DEFANG_SUBS:
         t = pat.sub(repl, t)
-    t = re.sub(r"\s{2,}", " ", t).strip()
+    t = re.sub(r'\s{2,}', ' ', t).strip()
     return t
 
-URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\'\]]+')
-DOMAIN_SIMPLE = re.compile(r"\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?")
-TELEGRAM_DOMAIN = re.compile(r"(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?")
+# ---- FIXED: single-quoted raw strings to avoid unterminated string literal issues ----
+URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\']+')
+DOMAIN_SIMPLE   = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
+TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
 
 def extract_urls_and_domains(text: str) -> List[str]:
     if not text:
@@ -140,7 +140,7 @@ def extract_urls_and_domains(text: str) -> List[str]:
         urls.add(m.group(0).rstrip(").,;!?'\"]"))
     for m in DOMAIN_SIMPLE.finditer(t):
         raw = m.group(0).rstrip(").,;!?'\"]")
-        if not re.match(r"(?i)^(?:https?|ftp)://", raw):
+        if not re.match(r'(?i)^(?:https?|ftp)://', raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
@@ -150,7 +150,7 @@ def extract_urls_and_domains(text: str) -> List[str]:
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-    for m in re.finditer(r"(?i)@\w{5,}", t):
+    for m in re.finditer(r'(?i)@\w{5,}', t):
         username = m.group(0)[1:]
         urls.add(f"https://t.me/{username}")
     normalized = [u.rstrip(").,;!?'\"]") for u in urls]
@@ -158,11 +158,11 @@ def extract_urls_and_domains(text: str) -> List[str]:
 
 def extract_ips(text: str, urls: List[str]) -> List[str]:
     t = deobfuscate_text(text or "")
-    ips = re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", t)
+    ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', t)
     for u in urls:
         try:
             host = urlparse(u).hostname
-            if host and re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", host):
+            if host and re.match(r'^(?:\d{1,3}\.){3}\d{1,3}$', host):
                 ips.append(host)
         except Exception:
             pass
@@ -663,7 +663,7 @@ async def handle_join_request(update: Update, context):
 
 # ------------- VirusTotal file scanning (with improved malicious handling) -------------
 def _normalize(s: str) -> str:
-    return re.sub(r"[\s_\-]+", "", (s or "")).lower()
+    return re.sub(r'[\s_\-]+', '', (s or '')).lower()
 
 def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, Optional[str]]:
     if not results:
@@ -928,7 +928,7 @@ application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, we
 application.add_handler(ChatJoinRequestHandler(handle_join_request), group=1)
 
 # Unified verification callback (fixed pattern)
-application.add_handler(CallbackQueryHandler(verify_callback, pattern=r"^(verify:|verify_join:)"), group=1)
+application.add_handler(CallbackQueryHandler(verify_callback, pattern=r'^(verify:|verify_join:)'), group=1)
 
 # Moderation
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate), group=1)
