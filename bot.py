@@ -53,8 +53,7 @@ GSB_LOOKUP = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 ABUSEIPDB_CHECK = "https://api.abuseipdb.com/api/v2/check"
 PERSPECTIVE_ANALYZE = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
 
-# ------------- Fixed policy thresholds & defaults (moved from env into code) -------------
-# Group policy
+# ------------- Fixed policy thresholds & defaults (in code) -------------
 BAD_WORDS = {"idiot", "stupid", "fool"}
 BLOCK_LINKS = False               # Default allow links but screen for malicious
 WARN_LIMIT = 2
@@ -62,23 +61,20 @@ FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
 MUTE_SECONDS = 60
 
-# Risk thresholds (hard-coded here; adjust in code if needed)
 TOXICITY_THRESHOLD = 0.85
 SEVERE_TOXICITY_THRESHOLD = 0.75
 INSULT_THRESHOLD = 0.85
 THREAT_THRESHOLD = 0.60
 ABUSEIPDB_CONFIDENCE_MIN = 75
 
-# Perspective throttling (per bot; in seconds)
 PERSPECTIVE_MIN_INTERVAL = 1.0
 
-# VirusTotal summary engines
 ENGINES_FOR_PROGRESS = [
     "Kaspersky","Avast","BitDefender","ESET-NOD32","Microsoft","Sophos","TrendMicro",
     "McAfee","DrWeb","Fortinet","ClamAV","Paloalto","Malwarebytes","VIPRE"
 ]
 DEFAULT_TOP_ENGINES = ["Microsoft", "Kaspersky", "BitDefender"]
-TOP_ENGINES = DEFAULT_TOP_ENGINES[:]  # fixed list; change here if you want different top engines
+TOP_ENGINES = DEFAULT_TOP_ENGINES[:]  # Change here if you want different engines
 
 # ---- Runtime state (in-memory only; no persistence) ----
 PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
@@ -89,7 +85,6 @@ UNVERIFIED = set()    # {(chat_id, user_id)}
 BOT_USERNAME = None   # filled at startup
 SESSION_USERNAMES: dict[int, Optional[str]] = {}
 
-# Simple throttle for Perspective (~1 QPS default)
 _last_perspective_call_ts = 0.0
 
 
@@ -126,7 +121,7 @@ def deobfuscate_text(text: str) -> str:
     t = re.sub(r'\s{2,}', ' ', t).strip()
     return t
 
-# ---- FIXED: single-quoted raw strings to avoid unterminated string literal issues ----
+# ---- Safe regex (single-quoted raw strings) ----
 URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\']+')
 DOMAIN_SIMPLE   = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
 TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
@@ -321,17 +316,12 @@ async def _auto_delete_message(context, chat_id: int, message_id: int, delay: in
     except Exception as e:
         logger.debug(f"auto-delete failed: {e}")
 
-# NEW: wrapper to auto-delete bot messages in groups by default
 async def send_ephemeral(context, chat_id: int, text: str, *, parse_mode=None, reply_markup=None, delay: int = None):
-    """
-    Sends a bot message and schedules auto-delete in groups unless disabled or overridden.
-    Will NOT auto-delete in private chats.
-    """
+    """Sends a bot message and schedules auto-delete in groups unless disabled."""
     m = await context.bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
     try:
         if delay is None:
             delay = BOT_MSG_TTL
-        # Only delete in groups/supergroups and if globally enabled
         if AUTO_DELETE_BOT_MSGS and delay > 0:
             chat = await context.bot.get_chat(chat_id)
             if getattr(chat, "type", "") in ("group", "supergroup"):
@@ -421,7 +411,7 @@ async def cmd_start(update: Update, context):
         options = list(range(1, 5)); random.shuffle(options)
         keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify_join:{token}:{int(n==correct)}")] for n in options]
         PENDING_CAPTCHA[update.effective_user.id] = {"chat_id": pending["chat_id"], "answer": correct, "mode": "pre", "token": token}
-        # Keep this interactive message (no auto-delete)
+        # Keep interactive message (no auto-delete)
         await context.bot.send_message(update.effective_chat.id, "🔐 Please solve the CAPTCHA to join the group. Pick the correct number:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
 
@@ -709,7 +699,6 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
 
     idx, prev, attempts, max_attempts = 0, None, 0, 120
     headers = {"x-apikey": VT_API_KEY}
-    summary_message_id = None
 
     while attempts < max_attempts:
         await asyncio.sleep(5)
@@ -736,10 +725,22 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                 engines_block = "\n".join(lines)
 
                 if (mal > 0) or (sus > 0):
-                    # Forward to vault (if configured), then delete original group message
+                    # Build HTML report (for both group and vault)
+                    file_html = html.escape(display_name)
+                    engines_html = html.escape(engines_block)
+                    report_html = (
+                        f"🛑 <b>RED ALERT: MALICIOUS FILE DETECTED</b>\n\n"
+                        f"📄 <b>File</b>: <code>{file_html}</code>\n\n"
+                        f"🔎 <b>Summary</b>:\n"
+                        f"<pre>Malicious: {mal}\nSuspicious: {sus}\nHarmless: {har}\nUndetected: {und}/{total_for_und}</pre>\n"
+                        f"🧪 <b>Top Engines</b>:\n<pre>{engines_html}</pre>"
+                    )
+
+                    # 1) Forward to vault (if configured), then delete original group message
+                    vault_forward_msg = None
                     try:
                         if VAULT_CHANNEL_ID:
-                            await context.bot.forward_message(
+                            vault_forward_msg = await context.bot.forward_message(
                                 chat_id=VAULT_CHANNEL_ID,
                                 from_chat_id=src_chat_id,
                                 message_id=src_message_id
@@ -752,18 +753,45 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                     except Exception as e:
                         logger.warning(f"Delete malicious src message failed: {e}")
 
-                    # RED ALERT (persistent)
-                    file_html = html.escape(display_name)
-                    engines_html = html.escape(engines_block)
-                    report_html = (
-                        f"🛑 <b>RED ALERT: MALICIOUS FILE DETECTED</b>\n\n"
-                        f"📄 <b>File</b>: <code>{file_html}</code>\n\n"
-                        f"🔎 <b>Summary</b>:\n"
-                        f"<pre>Malicious: {mal}\nSuspicious: {sus}\nHarmless: {har}\nUndetected: {und}/{total_for_und}</pre>\n"
-                        f"🧪 <b>Top Engines</b>:\n<pre>{engines_html}</pre>\n"
-                        f"📦 Stored in <b>Safeguard Malware Vault</b> (if configured)"
-                    )
+                    # 2) Post a persistent report in the group (no auto-delete)
                     await progress_msg.edit_text(report_html, parse_mode="HTML", disable_web_page_preview=True)
+
+                    # 3) Also post a report in the VAULT channel (so the forwarded file has context)
+                    try:
+                        if VAULT_CHANNEL_ID:
+                            # Extra context for vault: who, where, when
+                            try:
+                                # Try to fetch chat title; fallback to ID
+                                src_chat = await context.bot.get_chat(src_chat_id)
+                                chat_title = getattr(src_chat, "title", None) or str(src_chat_id)
+                            except Exception:
+                                chat_title = str(src_chat_id)
+
+                            # We may or may not have a sender username cached; safe fallback
+                            sender = None
+                            try:
+                                # We can't retrieve the original message's sender here reliably,
+                                # but we can include the channel post link or a generic note.
+                                # If needed, you can pass sender info from the caller.
+                                pass
+                            except Exception:
+                                pass
+
+                            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                            vault_context = (
+                                f"🧰 <b>Safeguard Malware Vault Report</b>\n"
+                                f"• <b>From group</b>: {html.escape(chat_title)} (ID: <code>{src_chat_id}</code>)\n"
+                                f"• <b>Time</b>: <code>{timestamp}</code>\n\n"
+                            )
+                            await context.bot.send_message(
+                                VAULT_CHANNEL_ID,
+                                vault_context + report_html,
+                                parse_mode="HTML",
+                                disable_web_page_preview=True,
+                                reply_to_message_id=(vault_forward_msg.message_id if vault_forward_msg else None)
+                            )
+                    except Exception as e:
+                        logger.warning(f"Vault report failed: {e}")
 
                 else:
                     # Benign summary (auto-delete after TTL)
@@ -780,8 +808,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                         f"🔔 Powered by CCU Teams of MPTC"
                     )
                     await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
-                    summary_message_id = progress_msg.message_id
-                    asyncio.create_task(_auto_delete_message(context, chat_id, summary_message_id, delay=BOT_MSG_TTL))
+                    asyncio.create_task(_auto_delete_message(context, chat_id, progress_msg.message_id, delay=BOT_MSG_TTL))
 
                 try:
                     os.remove(file_path)
