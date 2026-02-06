@@ -127,7 +127,7 @@ def deobfuscate_text(text: str) -> str:
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
-URL_WITH_SCHEME = re.compile(r"(?i)\b(?:https?|ftp)://[^\s<>\\"'\]]+")
+URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\'\]]+')
 DOMAIN_SIMPLE = re.compile(r"\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?")
 TELEGRAM_DOMAIN = re.compile(r"(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?")
 
