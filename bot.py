@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-import os, re, sys, random, logging, asyncio, string, base64, json, html
+import os, re, sys, random, logging, asyncio, string, base64, json, html, hashlib
 from datetime import datetime, timedelta
 from typing import Optional, List, Tuple
 from urllib.parse import urlparse
@@ -651,7 +651,37 @@ async def handle_join_request(update: Update, context):
         pass
 
 
-# ------------- VirusTotal file scanning (with improved malicious handling) -------------
+# ------------ VT helpers for 409/rescan & large files ------------
+def sha256_file(path: str) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def file_size_bytes(path: str) -> int:
+    try:
+        return os.path.getsize(path)
+    except Exception:
+        return 0
+
+async def _vt_request_rescan_by_hash(headers: dict, sha256: str) -> Optional[str]:
+    """
+    POST /files/{sha256}/analyse -> returns analysis id on success.
+    """
+    try:
+        r = requests.post(f"{VT_BASE}/files/{sha256}/analyse", headers=headers, timeout=15)
+        if r.status_code == 200:
+            return r.json().get("data", {}).get("id")
+        else:
+            logger.warning(f"VT rescan request failed: status={r.status_code}, body={r.text[:200]}")
+            return None
+    except Exception as e:
+        logger.warning(f"VT rescan request error: {e}")
+        return None
+
+
+# ------------- VirusTotal file scanning (with robust 409/large-file handling) -------------
 def _normalize(s: str) -> str:
     return re.sub(r'[\s_\-]+', '', (s or '')).lower()
 
@@ -686,25 +716,63 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
     if not VT_API_KEY:
         await progress_msg.edit_text("❌ VirusTotal API key (VT_API_KEY) not configured."); return
 
+    headers = {"x-apikey": VT_API_KEY}
+    sha256 = sha256_file(file_path)
+    size_bytes = file_size_bytes(file_path)
+
+    # Decide upload method per VT docs: /files for <=32MB, upload_url for >32MB
+    # (If >32MB we must first GET /files/upload_url, then POST to that URL.) [1](https://docs.virustotal.com/reference/files-scan)[2](https://docs.virustotal.com/reference/files-upload-url)
+    upload_url = None
+    try:
+        if size_bytes > 32 * 1024 * 1024:
+            r = requests.get(f"{VT_BASE}/files/upload_url", headers=headers, timeout=10)
+            if r.status_code == 200:
+                upload_url = r.json().get("data")
+            else:
+                logger.warning(f"VT upload_url failed: status={r.status_code}, body={r.text[:200]}")
+    except Exception as e:
+        logger.warning(f"VT upload_url error: {e}")
+
+    # Try upload-or-rescan logic
     try:
         with open(file_path, "rb") as f:
-            resp = requests.post(f"{VT_BASE}/files", headers={"x-apikey": VT_API_KEY}, files={"file": f})
-            resp.raise_for_status()
+            if upload_url:
+                resp = requests.post(upload_url, headers=headers, files={"file": f}, timeout=60)
+            else:
+                resp = requests.post(f"{VT_BASE}/files", headers=headers, files={"file": f}, timeout=60)
+
+        if resp.status_code in (200, 201):
             analysis_id = resp.json().get("data", {}).get("id")
             if not analysis_id:
                 await progress_msg.edit_text("❌ Failed to get analysis ID from VirusTotal."); return
             await progress_msg.edit_text("✅ File uploaded! Scanning in progress...")
+        elif resp.status_code == 409:
+            # Already submitted: request a rescan by hash and proceed. [3](https://docs.virustotal.com/reference/files-analyse)
+            analysis_id = await _vt_request_rescan_by_hash(headers, sha256)
+            if analysis_id:
+                await progress_msg.edit_text("♻️ File already exists on VirusTotal. Requested re‑analysis...")
+            else:
+                await progress_msg.edit_text("❌ VirusTotal returned 409 Conflict and rescan request failed.")
+                return
+        else:
+            # Other errors
+            await progress_msg.edit_text(f"❌ Upload error: {resp.status_code} {resp.reason} for url: {resp.url}")
+            return
+
     except Exception as e:
         await progress_msg.edit_text(f"❌ Upload error: {escape_markdown(str(e), version=2)}", parse_mode="MarkdownV2"); return
 
+    # Poll analysis until completion
     idx, prev, attempts, max_attempts = 0, None, 0, 120
-    headers = {"x-apikey": VT_API_KEY}
+    summary_message_id = None
 
     while attempts < max_attempts:
         await asyncio.sleep(5)
         try:
-            s = requests.get(f"{VT_BASE}/analyses/{analysis_id}", headers=headers)
-            s.raise_for_status()
+            s = requests.get(f"{VT_BASE}/analyses/{analysis_id}", headers=headers, timeout=15)
+            if s.status_code != 200:
+                attempts += 1
+                continue
             attrs = s.json().get("data", {}).get("attributes", {})
             if attrs.get("status") == "completed":
                 stats = attrs.get("stats", {}) or {}
@@ -714,7 +782,6 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                 sus = int(stats.get("suspicious", 0))
                 und = int(stats.get("undetected", 0))
                 har = int(stats.get("harmless", 0))
-
                 total_for_und = (mal + sus + und) if (mal + sus + und) > 0 else und
 
                 chosen = TOP_ENGINES[:3]
@@ -753,30 +820,17 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                     except Exception as e:
                         logger.warning(f"Delete malicious src message failed: {e}")
 
-                    # 2) Post a persistent report in the group (no auto-delete)
+                    # 2) Persistent report in the group
                     await progress_msg.edit_text(report_html, parse_mode="HTML", disable_web_page_preview=True)
 
                     # 3) Also post a report in the VAULT channel (so the forwarded file has context)
                     try:
                         if VAULT_CHANNEL_ID:
-                            # Extra context for vault: who, where, when
                             try:
-                                # Try to fetch chat title; fallback to ID
                                 src_chat = await context.bot.get_chat(src_chat_id)
                                 chat_title = getattr(src_chat, "title", None) or str(src_chat_id)
                             except Exception:
                                 chat_title = str(src_chat_id)
-
-                            # We may or may not have a sender username cached; safe fallback
-                            sender = None
-                            try:
-                                # We can't retrieve the original message's sender here reliably,
-                                # but we can include the channel post link or a generic note.
-                                # If needed, you can pass sender info from the caller.
-                                pass
-                            except Exception:
-                                pass
-
                             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                             vault_context = (
                                 f"🧰 <b>Safeguard Malware Vault Report</b>\n"
@@ -808,8 +862,10 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                         f"🔔 Powered by CCU Teams of MPTC"
                     )
                     await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
-                    asyncio.create_task(_auto_delete_message(context, chat_id, progress_msg.message_id, delay=BOT_MSG_TTL))
+                    summary_message_id = progress_msg.message_id
+                    asyncio.create_task(_auto_delete_message(context, chat_id, summary_message_id, delay=BOT_MSG_TTL))
 
+                # Clean up local temp file
                 try:
                     os.remove(file_path)
                 except Exception as e:
