@@ -145,9 +145,6 @@ def extract_urls_and_domains(text: str) -> List[str]:
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-    for m in re.finditer(r'(?i)@\w{5,}', t):
-        username = m.group(0)[1:]
-        urls.add(f"https://t.me/{username}")
     normalized = [u.rstrip(").,;!?'\"]") for u in urls]
     return normalized[:20]
 
@@ -352,7 +349,11 @@ def build_welcome_message(name: str) -> str:
 
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
     """Unified incident popup; dynamic Action/Evidence, 60s mute; admins & vault get same banner.
-    Evidence only shows a real URL when reason starts with 'malicious_link:'.
+    Only reasons with explicit prefixes control action/evidence:
+      - malicious_link:<url>
+      - banned_keyword:<word>
+      - malicious_ip:<ip>
+      - toxicity (raw message)
     Incident banner is NOT auto-deleted (delay=0).
     """
     await delete_message_safe(update, context)
@@ -609,7 +610,6 @@ async def moderate(update: Update, context):
     urls = extract_urls_and_domains(text)
     if urls:
         # 1) Always screen links with GSB/VT (skip allowlisted hosts like Telegram)
-        # Build a scan list that excludes allowlisted domains
         scan_urls = []
         allow = ('t.me', 'telegram.me', 'telegram.dog')
         for _u in (urls or []):
