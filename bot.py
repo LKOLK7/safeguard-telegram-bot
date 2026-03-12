@@ -126,29 +126,40 @@ URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\']+')
 DOMAIN_SIMPLE   = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
 TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
 
+
 def extract_urls_and_domains(text: str) -> List[str]:
+    """Extract real URLs/domains from text.
+    NOTE: We intentionally do NOT convert @mentions into t.me links anymore,
+    to avoid false positives when users tag other members (e.g., @admin).
+    """
     if not text:
         return []
     t = deobfuscate_text(text)
     urls = set()
+
+    # 1) URLs with scheme
     for m in URL_WITH_SCHEME.finditer(t):
-        urls.add(m.group(0).rstrip(").,;!?'\"]"))
+        urls.add(m.group(0).rstrip(".),;!?'"]"))
+
+    # 2) Bare domains like example.com/path
     for m in DOMAIN_SIMPLE.finditer(t):
-        raw = m.group(0).rstrip(").,;!?'\"]")
+        raw = m.group(0).rstrip(".),;!?'"]")
         if not re.match(r'(?i)^(?:https?|ftp)://', raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
+
+    # 3) Telegram domains if explicitly written (t.me / telegram.me). We keep them
+    # in the list so admins can decide to allow/deny explicit Telegram links, but
+    # they will be whitelisted from malware checks later.
     for m in TELEGRAM_DOMAIN.finditer(t):
-        raw = m.group(0).rstrip(").,;!?'\"]")
+        raw = m.group(0).rstrip(".),;!?'"]")
         if not raw.startswith("http"):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-    for m in re.finditer(r'(?i)@\w{5,}', t):
-        username = m.group(0)[1:]
-        urls.add(f"https://t.me/{username}")
-    normalized = [u.rstrip(").,;!?'\"]") for u in urls]
+
+    normalized = [u.rstrip(".),;!?'"]") for u in urls]
     return normalized[:20]
 
 def extract_ips(text: str, urls: List[str]) -> List[str]:
@@ -350,57 +361,27 @@ def build_welcome_message(name: str) -> str:
 
 # ------------- Incident response -------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    """Unified incident popup; dynamic Action/Evidence, 60s mute; send to admins & vault.
-    - Evidence shows the *real malicious link* when provided as reason starting with "malicious_link:".
-    - Incident banner is NOT auto-deleted in group/bot (delay=0).
-    """
-    await delete_message_safe(update, context)
-    add_warning(chat_id, user.id)
+    if severity in ("medium","high","critical"):
+        await delete_message_safe(update, context)
 
-    rlow = (reason or '').lower()
-    action = 'Policy violation'
-    evidence = 'violation'
+    total = add_warning(chat_id, user.id)
 
-    if rlow.startswith('malicious_link:'):
-        action = 'Posted malicious link'
-        evidence = reason.split(':', 1)[1].strip() or 'malicious link'
-    elif rlow.startswith('banned_keyword:'):
-        word = reason.split(':', 1)[1].strip() if ':' in reason else '***'
-        action = 'Posted banned keyword'
-        evidence = f'"{word}" (offensive language)'
-    elif '[gsb]' in rlow or 'safe browsing' in rlow or 'safebrowsing' in rlow or '[vt]' in rlow or 'virustotal' in rlow:
-        action = 'Posted malicious link'
-        evidence = 'malicious link'
-    elif 'abuseipdb' in rlow or 'ip reputation' in rlow:
-        action = 'Shared malicious IP'
-        evidence = 'malicious IP'
-    elif 'toxic content' in rlow or 'tox=' in rlow or 'insult=' in rlow or 'threat=' in rlow:
-        action = 'Posted toxic message'
-        evidence = 'toxic message'
-
-    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (f"@{user.username}" if user.username else str(user.id))
-    user_tag = f" (@{user.username})" if user.username else ''
-
-    popup = f"""🚨 INCIDENT DETECTED
-• User: {full_name}{user_tag}
-• Action: {action}
-• Risk Level: HIGH
-• Response: Message removed, user muted 60 seconds
-• Evidence: {evidence}"""
-
-    await send_ephemeral(context, chat_id, popup, delay=0)
-    await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=60))
+    if severity == "low":
+        await send_ephemeral(context, chat_id, f"⚠️ {reason}. Please avoid posting risky content, @{user.username or user.first_name}.")
+    elif severity == "medium":
+        await send_ephemeral(context, chat_id, f"🛑 {reason}. Message removed. Warning ({total}/{WARN_LIMIT}).", delay=MUTE_SECONDS)
+    elif severity == "high":
+        await send_ephemeral(context, chat_id, f"🚫 {reason}. You are temporarily muted for {MUTE_SECONDS}s.", delay=MUTE_SECONDS)
+        await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
+    else:
+        await send_ephemeral(context, chat_id, f"⛔ {reason}. You are muted for {MUTE_SECONDS*3}s.", delay=MUTE_SECONDS)
+        await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS*3))
 
     try:
-        await notify_admins(context, popup)
+        await notify_admins(context, f"🔎 Security action\n• Chat: {chat_id}\n• UID: {user.id}\n• Reason: {reason}\n• Severity: {severity}")
     except Exception:
         pass
 
-    try:
-        if VAULT_CHANNEL_ID:
-            await context.bot.send_message(VAULT_CHANNEL_ID, popup)
-    except Exception as e:
-        logger.warning(f'Vault post failed: {e}')
 
 # ------------- Diagnostics -------------
 async def log_all_updates(update: Update, context):
@@ -597,41 +578,41 @@ async def moderate(update: Update, context):
                 await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
                 return
 
-    # Offensive keyword handling -> route through auto_mitigate with the matched word
-
-    lw = (text or '').lower()
-
-    bad_hit = None
-
-    for _w in BAD_WORDS:
-
-        if _w in lw:
-
-            bad_hit = _w
-
-            break
-
-    if bad_hit:
-
-        await auto_mitigate(update, context, user, chat_id, reason="banned_keyword:" + bad_hit, severity="high")
-
+    if any(bad in text.lower() for bad in BAD_WORDS):
+        await delete_message_safe(update, context)
+        total = add_warning(chat_id, user.id)
+        if total >= WARN_LIMIT:
+            await send_ephemeral(context, chat_id, f"🚫 Keep it civil. Muted for {MUTE_SECONDS}s.", delay=MUTE_SECONDS)
+            await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
+        else:
+            await send_ephemeral(context, chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.", delay=MUTE_SECONDS)
         return
-
 
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
     if urls:
-        # 1) Always screen links with GSB/VT
-        gsb_bad, gsb_detail = check_google_safebrowsing(urls)
-        vt_bad, vt_detail = check_virustotal_url(urls[0]) if urls else (False, "")
+        # Whitelist Telegram domains from malware checks to avoid false positives
+        whitelist = {"t.me", "telegram.me"}
+        def host(u):
+            try:
+                return urlparse(u).hostname or ''
+            except Exception:
+                return ''
+        non_tg_urls = [u for u in urls if host(u) and not any(host(u).lower().endswith(d) for d in whitelist)]
+
+        # 1) Screen only non-Telegram links with GSB/VT
+        gsb_bad, gsb_detail = check_google_safebrowsing(non_tg_urls) if non_tg_urls else (False, "")
+        vt_bad, vt_detail = (check_virustotal_url(non_tg_urls[0]) if non_tg_urls else (False, ""))
         if gsb_bad or vt_bad:
-            bad_url = urls[0] if urls else ''
+            reasons = []
+            if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
+            if vt_bad: reasons.append(f"[VT] {vt_detail}")
             severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
-            await auto_mitigate(update, context, user, chat_id, reason="malicious_link:" + bad_url, severity=severity)
+            await auto_mitigate(update, context, user, chat_id, " ; ".join(reasons), severity=severity)
             return
 
-        # 2) Optional classroom mode: blanket block even if clean
-        if BLOCK_LINKS:
+        # 2) Optional classroom mode: blanket block even if clean (non-Telegram only)
+        if BLOCK_LINKS and non_tg_urls:
             await delete_message_safe(update, context)
             await send_ephemeral(
                 context,
