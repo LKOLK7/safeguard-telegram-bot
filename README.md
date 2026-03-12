@@ -126,29 +126,40 @@ URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\']+')
 DOMAIN_SIMPLE   = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
 TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
 
+
 def extract_urls_and_domains(text: str) -> List[str]:
+    """Extract real URLs/domains from text.
+    NOTE: We intentionally do NOT convert @mentions into t.me links anymore,
+    to avoid false positives when users tag other members (e.g., @admin).
+    """
     if not text:
         return []
     t = deobfuscate_text(text)
     urls = set()
+
+    # 1) URLs with scheme
     for m in URL_WITH_SCHEME.finditer(t):
-        urls.add(m.group(0).rstrip(").,;!?'\"]"))
+        urls.add(m.group(0).rstrip(".),;!?'"]"))
+
+    # 2) Bare domains like example.com/path
     for m in DOMAIN_SIMPLE.finditer(t):
-        raw = m.group(0).rstrip(").,;!?'\"]")
+        raw = m.group(0).rstrip(".),;!?'"]")
         if not re.match(r'(?i)^(?:https?|ftp)://', raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
+
+    # 3) Telegram domains if explicitly written (t.me / telegram.me). We keep them
+    # in the list so admins can decide to allow/deny explicit Telegram links, but
+    # they will be whitelisted from malware checks later.
     for m in TELEGRAM_DOMAIN.finditer(t):
-        raw = m.group(0).rstrip(").,;!?'\"]")
+        raw = m.group(0).rstrip(".),;!?'"]")
         if not raw.startswith("http"):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-    for m in re.finditer(r'(?i)@\w{5,}', t):
-        username = m.group(0)[1:]
-        urls.add(f"https://t.me/{username}")
-    normalized = [u.rstrip(").,;!?'\"]") for u in urls]
+
+    normalized = [u.rstrip(".),;!?'"]") for u in urls]
     return normalized[:20]
 
 def extract_ips(text: str, urls: List[str]) -> List[str]:
@@ -580,9 +591,18 @@ async def moderate(update: Update, context):
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
     if urls:
-        # 1) Always screen links with GSB/VT
-        gsb_bad, gsb_detail = check_google_safebrowsing(urls)
-        vt_bad, vt_detail = check_virustotal_url(urls[0]) if urls else (False, "")
+        # Whitelist Telegram domains from malware checks to avoid false positives
+        whitelist = {"t.me", "telegram.me"}
+        def host(u):
+            try:
+                return urlparse(u).hostname or ''
+            except Exception:
+                return ''
+        non_tg_urls = [u for u in urls if host(u) and not any(host(u).lower().endswith(d) for d in whitelist)]
+
+        # 1) Screen only non-Telegram links with GSB/VT
+        gsb_bad, gsb_detail = check_google_safebrowsing(non_tg_urls) if non_tg_urls else (False, "")
+        vt_bad, vt_detail = (check_virustotal_url(non_tg_urls[0]) if non_tg_urls else (False, ""))
         if gsb_bad or vt_bad:
             reasons = []
             if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
@@ -591,8 +611,8 @@ async def moderate(update: Update, context):
             await auto_mitigate(update, context, user, chat_id, " ; ".join(reasons), severity=severity)
             return
 
-        # 2) Optional classroom mode: blanket block even if clean
-        if BLOCK_LINKS:
+        # 2) Optional classroom mode: blanket block even if clean (non-Telegram only)
+        if BLOCK_LINKS and non_tg_urls:
             await delete_message_safe(update, context)
             await send_ephemeral(
                 context,
