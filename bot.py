@@ -350,27 +350,50 @@ def build_welcome_message(name: str) -> str:
 
 # ------------- Incident response -------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    if severity in ("medium","high","critical"):
-        await delete_message_safe(update, context)
+    """Unified incident popup used everywhere; dynamic Action/Evidence, 60s mute; send to admins & vault.
+"""
+    await delete_message_safe(update, context)
+    add_warning(chat_id, user.id)
+    rlow = (reason or '').lower()
+    action = 'Policy violation'
+    evidence = 'violation'
+    if rlow.startswith('banned_keyword:'):
+        word = reason.split(':', 1)[1].strip() if ':' in reason else '***'
+        action = 'Posted banned keyword'
+        evidence = f'"{word}" (offensive language)'
+    elif '[gsb]' in rlow or 'safe browsing' in rlow or 'safebrowsing' in rlow or 'http' in rlow or 'https' in rlow or '[vt]' in rlow or 'virustotal' in rlow:
+        action = 'Posted malicious link'
+        evidence = 'malicious link'
+    elif 'abuseipdb' in rlow or 'ip reputation' in rlow:
+        action = 'Shared malicious IP'
+        evidence = 'malicious IP'
+    elif 'toxic content' in rlow or 'tox=' in rlow or 'insult=' in rlow or 'threat=' in rlow:
+        action = 'Posted toxic message'
+        evidence = 'toxic message'
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (f"@{user.username}" if user.username else str(user.id))
+    user_tag = f" (@{user.username})" if user.username else ''
+    popup = f"""🚨 INCIDENT DETECTED
 
-    total = add_warning(chat_id, user.id)
+• User: {full_name}{user_tag}
 
-    if severity == "low":
-        await send_ephemeral(context, chat_id, f"⚠️ {reason}. Please avoid posting risky content, @{user.username or user.first_name}.")
-    elif severity == "medium":
-        await send_ephemeral(context, chat_id, f"🛑 {reason}. Message removed. Warning ({total}/{WARN_LIMIT}).", delay=MUTE_SECONDS)
-    elif severity == "high":
-        await send_ephemeral(context, chat_id, f"🚫 {reason}. You are temporarily muted for {MUTE_SECONDS}s.", delay=MUTE_SECONDS)
-        await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
-    else:
-        await send_ephemeral(context, chat_id, f"⛔ {reason}. You are muted for {MUTE_SECONDS*3}s.", delay=MUTE_SECONDS)
-        await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS*3))
+• Action: {action}
 
+• Risk Level: HIGH
+
+• Response: Message removed, user muted 60 seconds
+
+• Evidence: {evidence}"""
+    await send_ephemeral(context, chat_id, popup)
+    await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=60))
     try:
-        await notify_admins(context, f"🔎 Security action\n• Chat: {chat_id}\n• UID: {user.id}\n• Reason: {reason}\n• Severity: {severity}")
+        await notify_admins(context, popup)
     except Exception:
         pass
-
+    try:
+        if VAULT_CHANNEL_ID:
+            await context.bot.send_message(VAULT_CHANNEL_ID, popup)
+    except Exception as e:
+        logger.warning(f'Vault post failed: {e}')
 
 # ------------- Diagnostics -------------
 async def log_all_updates(update: Update, context):
@@ -566,15 +589,15 @@ async def moderate(update: Update, context):
                 reason = f"Toxic content detected (tox={tox:.2f}, severe={sev:.2f}, insult={ins:.2f}, threat={thr:.2f})"
                 await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
                 return
-
-    if any(bad in text.lower() for bad in BAD_WORDS):
-        await delete_message_safe(update, context)
-        total = add_warning(chat_id, user.id)
-        if total >= WARN_LIMIT:
-            await send_ephemeral(context, chat_id, f"🚫 Keep it civil. Muted for {MUTE_SECONDS}s.", delay=MUTE_SECONDS)
-            await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
-        else:
-            await send_ephemeral(context, chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.", delay=MUTE_SECONDS)
+    # Offensive keyword handling -> route through auto_mitigate with the matched word
+    lw = (text or '').lower()
+    bad_hit = None
+    for _w in BAD_WORDS:
+        if _w in lw:
+            bad_hit = _w
+            break
+    if bad_hit:
+        await auto_mitigate(update, context, user, chat_id, reason=f"banned_keyword:{bad_hit}", severity="high")
         return
 
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
