@@ -129,8 +129,9 @@ TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
 
 def extract_urls_and_domains(text: str) -> List[str]:
     """Extract real URLs/domains from text.
-    NOTE: We intentionally do NOT convert @mentions into t.me links anymore,
-    to avoid false positives when users tag other members (e.g., @admin).
+    - Does NOT convert @mentions into t.me links (avoids false positives).
+    - Keeps explicit Telegram links (t.me / telegram.me) for possible policy checks
+      but these will be whitelisted from malware scanning in `moderate()`.
     """
     if not text:
         return []
@@ -149,9 +150,7 @@ def extract_urls_and_domains(text: str) -> List[str]:
         else:
             urls.add(raw)
 
-    # 3) Telegram domains if explicitly written (t.me / telegram.me). We keep them
-    # in the list so admins can decide to allow/deny explicit Telegram links, but
-    # they will be whitelisted from malware checks later.
+    # 3) Explicit Telegram domains (t.me / telegram.me)
     for m in TELEGRAM_DOMAIN.finditer(t):
         raw = m.group(0).rstrip(".),;!?'"]")
         if not raw.startswith("http"):
@@ -159,8 +158,10 @@ def extract_urls_and_domains(text: str) -> List[str]:
         else:
             urls.add(raw)
 
+    # NOTE: We intentionally DO NOT convert @mentions into URLs anymore.
     normalized = [u.rstrip(".),;!?'"]") for u in urls]
     return normalized[:20]
+
 
 def extract_ips(text: str, urls: List[str]) -> List[str]:
     t = deobfuscate_text(text or "")
@@ -591,7 +592,7 @@ async def moderate(update: Update, context):
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
     if urls:
-        # Whitelist Telegram domains from malware checks to avoid false positives
+        # Whitelist Telegram domains from malware checks / blocking
         whitelist = {"t.me", "telegram.me"}
         def host(u):
             try:
@@ -601,12 +602,12 @@ async def moderate(update: Update, context):
         non_tg_urls = [u for u in urls if host(u) and not any(host(u).lower().endswith(d) for d in whitelist)]
 
         # 1) Screen only non-Telegram links with GSB/VT
-        gsb_bad, gsb_detail = check_google_safebrowsing(non_tg_urls) if non_tg_urls else (False, "")
-        vt_bad, vt_detail = (check_virustotal_url(non_tg_urls[0]) if non_tg_urls else (False, ""))
+        gsb_bad, gsb_detail = (check_google_safebrowsing(non_tg_urls) if non_tg_urls else (False, ""))
+        vt_bad, vt_detail  = (check_virustotal_url(non_tg_urls[0]) if non_tg_urls else (False, ""))
         if gsb_bad or vt_bad:
             reasons = []
             if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
-            if vt_bad: reasons.append(f"[VT] {vt_detail}")
+            if vt_bad:  reasons.append(f"[VT] {vt_detail}")
             severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
             await auto_mitigate(update, context, user, chat_id, " ; ".join(reasons), severity=severity)
             return
