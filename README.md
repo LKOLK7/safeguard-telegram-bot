@@ -348,15 +348,18 @@ def build_welcome_message(name: str) -> str:
 # ------------- Incident response -------------
 
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    """Unified incident popup; dynamic Action/Evidence, 60s mute; admins & vault get same banner.
-    Only reasons with explicit prefixes control action/evidence:
-      - malicious_link:<url>
-      - banned_keyword:<word>
-      - malicious_ip:<ip>
-      - toxicity (raw message)
-    Incident banner is NOT auto-deleted (delay=0).
+    """Unified incident popup; dynamic Action/Evidence, 60s mute.
+    Only explicit prefixes control action/evidence:
+      - malicious_link:<url>  -> Action: Posted malicious link; Evidence: <url>
+      - banned_keyword:<word> -> Action: Posted banned keyword; Evidence: "word" (offensive language)
+      - malicious_ip:<ip>     -> Action: Shared malicious IP; Evidence: <ip> (...)
+      - Toxicity reasons keep their raw text as Evidence
+    The banner is NOT auto-deleted (delay=0) and is sent to Admins & Vault.
     """
+    # Always remove offending message
     await delete_message_safe(update, context)
+
+    # Maintain warning counter
     add_warning(chat_id, user.id)
 
     rlow = (reason or '').lower()
@@ -377,6 +380,7 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
         action = 'Posted toxic message'
         evidence = reason
 
+    # Build display name: Full Name (@username)
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (f"@{user.username}" if user.username else str(user.id))
     user_tag = f" (@{user.username})" if user.username else ''
 
@@ -387,14 +391,19 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
 • Response: Message removed, user muted 60 seconds
 • Evidence: {evidence}"""
 
+    # Keep the popup (no auto-delete)
     await send_ephemeral(context, chat_id, popup, delay=0)
+
+    # Enforce 60-second mute
     await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=60))
 
+    # Send to admins
     try:
         await notify_admins(context, popup)
     except Exception:
         pass
 
+    # Send to Safeguard Malware Vault (if configured)
     try:
         if VAULT_CHANNEL_ID:
             await context.bot.send_message(VAULT_CHANNEL_ID, popup)
@@ -596,15 +605,26 @@ async def moderate(update: Update, context):
                 await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
                 return
 
-    if any(bad in text.lower() for bad in BAD_WORDS):
-        await delete_message_safe(update, context)
-        total = add_warning(chat_id, user.id)
-        if total >= WARN_LIMIT:
-            await send_ephemeral(context, chat_id, f"🚫 Keep it civil. Muted for {MUTE_SECONDS}s.", delay=MUTE_SECONDS)
-            await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
-        else:
-            await send_ephemeral(context, chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.", delay=MUTE_SECONDS)
+    # Offensive keyword handling -> route through auto_mitigate with the matched word
+
+    lw = (text or '').lower()
+
+    bad_hit = None
+
+    for _w in BAD_WORDS:
+
+        if _w in lw:
+
+            bad_hit = _w
+
+            break
+
+    if bad_hit:
+
+        await auto_mitigate(update, context, user, chat_id, reason='banned_keyword:' + bad_hit, severity='high')
+
         return
+
 
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
