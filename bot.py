@@ -350,27 +350,37 @@ def build_welcome_message(name: str) -> str:
 
 # ------------- Incident response -------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    if severity in ("medium","high","critical"):
-        await delete_message_safe(update, context)
+    """Unified incident popup used everywhere this function is called.
+    Ignores `reason` and `severity` to always show the same text.
+    """
+    # Always remove the offending content
+    await delete_message_safe(update, context)
 
-    total = add_warning(chat_id, user.id)
+    # Build fixed popup (only @username and user_id are dynamic)
+    uname = user.username or str(user.id)
+    user_display = f"@{uname}"
+    case_id = "IR-20260312-1192"
+    popup = (
+        "🚨 INCIDENT DETECTED\n"
+        f"• User: {user_display} ({user.id})\n"
+        "• Action: Posted banned keyword\n"
+        "• Risk Level: HIGH\n"
+        "• Response: Message removed, user muted 15 minutes\n"
+        '• Evidence: "stupid" (offensive language)\n'
+        f"• Case ID: {case_id}"
+    )
 
-    if severity == "low":
-        await send_ephemeral(context, chat_id, f"⚠️ {reason}. Please avoid posting risky content, @{user.username or user.first_name}.")
-    elif severity == "medium":
-        await send_ephemeral(context, chat_id, f"🛑 {reason}. Message removed. Warning ({total}/{WARN_LIMIT}).", delay=MUTE_SECONDS)
-    elif severity == "high":
-        await send_ephemeral(context, chat_id, f"🚫 {reason}. You are temporarily muted for {MUTE_SECONDS}s.", delay=MUTE_SECONDS)
-        await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
-    else:
-        await send_ephemeral(context, chat_id, f"⛔ {reason}. You are muted for {MUTE_SECONDS*3}s.", delay=MUTE_SECONDS)
-        await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS*3))
+    # Send popup to the current chat (ephemeral if configured)
+    await send_ephemeral(context, chat_id, popup)
 
+    # Enforce a 15-minute mute regardless of severity
+    await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(minutes=15))
+
+    # Notify admins (keep existing behavior)
     try:
         await notify_admins(context, f"🔎 Security action\n• Chat: {chat_id}\n• UID: {user.id}\n• Reason: {reason}\n• Severity: {severity}")
     except Exception:
         pass
-
 
 # ------------- Diagnostics -------------
 async def log_all_updates(update: Update, context):
