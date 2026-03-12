@@ -350,35 +350,56 @@ def build_welcome_message(name: str) -> str:
 
 # ------------- Incident response -------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    """Unified incident popup used everywhere this function is called.
-    Ignores `reason` and `severity` to always show the same text.
-    """
-    # Always remove the offending content
-    await delete_message_safe(update, context)
+    """Unified incident popup used everywhere; dynamic Action/Evidence and 60s mute.
 
-    # Build fixed popup (only @username and user_id are dynamic)
+    """
+    await delete_message_safe(update, context)
+    add_warning(chat_id, user.id)
+
+    rlow = (reason or '').lower()
+    action = 'Policy violation'
+    evidence = reason or ''
+
+    if rlow.startswith('banned_keyword:'):
+        word = reason.split(':', 1)[1].strip() if ':' in reason else '***'
+        action = 'Posted banned keyword'
+        evidence = f'"{word}" (offensive language)'
+    elif '[gsb]' in rlow or 'safe browsing' in rlow or 'safebrowsing' in rlow:
+        action = 'Posted malicious link'
+        evidence = reason
+    elif '[vt]' in rlow or 'virustotal' in rlow:
+        action = 'Posted malicious link'
+        evidence = reason
+    elif 'abuseipdb' in rlow or 'ip reputation' in rlow:
+        action = 'Shared malicious IP'
+        evidence = reason
+    elif 'toxic content' in rlow or 'tox=' in rlow or 'insult=' in rlow or 'threat=' in rlow:
+        action = 'Posted toxic message'
+        evidence = reason
+
     uname = user.username or str(user.id)
     user_display = f"@{uname}"
-    case_id = "IR-20260312-1192"
-    popup = (
-        "🚨 INCIDENT DETECTED\n"
-        f"• User: {user_display} ({user.id})\n"
-        "• Action: Posted banned keyword\n"
-        "• Risk Level: HIGH\n"
-        "• Response: Message removed, user muted 15 minutes\n"
-        '• Evidence: "stupid" (offensive language)\n'
-        f"• Case ID: {case_id}"
-    )
+    case_id = 'IR-20260312-1192'
 
-    # Send popup to the current chat (ephemeral if configured)
+    popup = f"""🚨 INCIDENT DETECTED
+
+• User: {user_display} ({user.id})
+
+• Action: {action}
+
+• Risk Level: HIGH
+
+• Response: Message removed, user muted 60 seconds
+
+• Evidence: {evidence}
+
+• Case ID: {case_id}"""
+
     await send_ephemeral(context, chat_id, popup)
+    await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=60))
 
-    # Enforce a 15-minute mute regardless of severity
-    await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(minutes=15))
-
-    # Notify admins (keep existing behavior)
     try:
-        await notify_admins(context, f"🔎 Security action\n• Chat: {chat_id}\n• UID: {user.id}\n• Reason: {reason}\n• Severity: {severity}")
+        await notify_admins(context, popup)
     except Exception:
         pass
 
@@ -576,15 +597,15 @@ async def moderate(update: Update, context):
                 reason = f"Toxic content detected (tox={tox:.2f}, severe={sev:.2f}, insult={ins:.2f}, threat={thr:.2f})"
                 await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
                 return
-
-    if any(bad in text.lower() for bad in BAD_WORDS):
-        await delete_message_safe(update, context)
-        total = add_warning(chat_id, user.id)
-        if total >= WARN_LIMIT:
-            await send_ephemeral(context, chat_id, f"🚫 Keep it civil. Muted for {MUTE_SECONDS}s.", delay=MUTE_SECONDS)
-            await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
-        else:
-            await send_ephemeral(context, chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.", delay=MUTE_SECONDS)
+    # Offensive keyword handling -> route through auto_mitigate with the matched word
+    lw = (text or '').lower()
+    bad_hit = None
+    for _w in BAD_WORDS:
+        if _w in lw:
+            bad_hit = _w
+            break
+    if bad_hit:
+        await auto_mitigate(update, context, user, chat_id, reason=f"banned_keyword:{bad_hit}", severity="high")
         return
 
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
