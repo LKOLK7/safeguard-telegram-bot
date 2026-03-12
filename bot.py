@@ -350,40 +350,31 @@ def build_welcome_message(name: str) -> str:
 
 # ------------- Incident response -------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    """Unified incident popup used everywhere; dynamic Action/Evidence and 60s mute.
-
-    """
+    """Unified incident popup used everywhere; dynamic Action/Evidence, 60s mute; send to admins & vault.
+"""
     await delete_message_safe(update, context)
     add_warning(chat_id, user.id)
-
     rlow = (reason or '').lower()
     action = 'Policy violation'
-    evidence = reason or ''
-
+    evidence = 'violation'
     if rlow.startswith('banned_keyword:'):
         word = reason.split(':', 1)[1].strip() if ':' in reason else '***'
         action = 'Posted banned keyword'
         evidence = f'"{word}" (offensive language)'
-    elif '[gsb]' in rlow or 'safe browsing' in rlow or 'safebrowsing' in rlow:
+    elif '[gsb]' in rlow or 'safe browsing' in rlow or 'safebrowsing' in rlow or 'http' in rlow or 'https' in rlow or '[vt]' in rlow or 'virustotal' in rlow:
         action = 'Posted malicious link'
-        evidence = reason
-    elif '[vt]' in rlow or 'virustotal' in rlow:
-        action = 'Posted malicious link'
-        evidence = reason
+        evidence = 'malicious link'
     elif 'abuseipdb' in rlow or 'ip reputation' in rlow:
         action = 'Shared malicious IP'
-        evidence = reason
+        evidence = 'malicious IP'
     elif 'toxic content' in rlow or 'tox=' in rlow or 'insult=' in rlow or 'threat=' in rlow:
         action = 'Posted toxic message'
-        evidence = reason
-
-    uname = user.username or str(user.id)
-    user_display = f"@{uname}"
-    case_id = 'IR-20260312-1192'
-
+        evidence = 'toxic message'
+    full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (f"@{user.username}" if user.username else str(user.id))
+    user_tag = f" (@{user.username})" if user.username else ''
     popup = f"""🚨 INCIDENT DETECTED
 
-• User: {user_display} ({user.id})
+• User: {full_name}{user_tag}
 
 • Action: {action}
 
@@ -391,17 +382,18 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
 
 • Response: Message removed, user muted 60 seconds
 
-• Evidence: {evidence}
-
-• Case ID: {case_id}"""
-
+• Evidence: {evidence}"""
     await send_ephemeral(context, chat_id, popup)
     await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=60))
-
     try:
         await notify_admins(context, popup)
     except Exception:
         pass
+    try:
+        if VAULT_CHANNEL_ID:
+            await context.bot.send_message(VAULT_CHANNEL_ID, popup)
+    except Exception as e:
+        logger.warning(f'Vault post failed: {e}')
 
 # ------------- Diagnostics -------------
 async def log_all_updates(update: Update, context):
