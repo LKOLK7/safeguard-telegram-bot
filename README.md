@@ -349,10 +349,11 @@ def build_welcome_message(name: str) -> str:
 
 
 # ------------- Incident response -------------
+
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    """Unified incident popup; dynamic Action/Evidence, 60s mute; send to admins & vault.
-    Evidence shows the real malicious link only when reason starts with 'malicious_link:'.
-    Banner is NOT auto-deleted (delay=0).
+    """Unified incident popup; dynamic Action/Evidence, 60s mute; admins & vault get same banner.
+    Evidence only shows a real URL when reason starts with 'malicious_link:'.
+    Incident banner is NOT auto-deleted (delay=0).
     """
     await delete_message_safe(update, context)
     add_warning(chat_id, user.id)
@@ -397,7 +398,7 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
         if VAULT_CHANNEL_ID:
             await context.bot.send_message(VAULT_CHANNEL_ID, popup)
     except Exception as e:
-        logger.warning(f'Vault post failed: {e}')
+        logger.warning(f"Vault post failed: {e}")
 
 # ------------- Diagnostics -------------
 async def log_all_updates(update: Update, context):
@@ -607,20 +608,23 @@ async def moderate(update: Update, context):
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
     if urls:
-        # 1) Always screen links with GSB/VT
-        gsb_bad, gsb_detail = check_google_safebrowsing(urls)
-        vt_bad, vt_detail = check_virustotal_url(urls[0]) if urls else (False, "")
-        if gsb_bad or vt_bad:
-            # Skip allowlisted hosts even if a service returns noisy signals
-            bad_url = urls[0] if urls else ''
+        # 1) Always screen links with GSB/VT (skip allowlisted hosts like Telegram)
+        # Build a scan list that excludes allowlisted domains
+        scan_urls = []
+        allow = ('t.me', 'telegram.me', 'telegram.dog')
+        for _u in (urls or []):
             try:
-                host = urlparse(bad_url).hostname or ''
+                _h = urlparse(_u).hostname or ''
             except Exception:
-                host = ''
-            allow = ('t.me', 'telegram.me', 'telegram.dog')
-            if any(host == h or host.endswith('.'+h) for h in allow):
-                pass
-            else:
+                _h = ''
+            if any(_h == h or _h.endswith('.'+h) for h in allow):
+                continue
+            scan_urls.append(_u)
+        if scan_urls:
+            gsb_bad, gsb_detail = check_google_safebrowsing(scan_urls)
+            vt_bad, vt_detail = check_virustotal_url(scan_urls[0]) if scan_urls else (False, "")
+            if gsb_bad or vt_bad:
+                bad_url = scan_urls[0]
                 severity = 'high' if ('MALWARE' in gsb_detail or vt_bad) else 'medium'
                 await auto_mitigate(update, context, user, chat_id, reason='malicious_link:' + bad_url, severity=severity)
                 return
@@ -647,7 +651,7 @@ async def moderate(update: Update, context):
                     bad_hits.append((ip, score, detail))
             if bad_hits:
                 worst = max(bad_hits, key=lambda x: x[1])
-                reason = 'malicious_ip:' + worst[0] + f' (confidence={worst[1]}) via AbuseIPDB'
+                reason = f"IP reputation bad: {worst[0]} (confidence={worst[1]}) via AbuseIPDB"
                 await auto_mitigate(update, context, user, chat_id, reason, severity="high")
                 return
 
