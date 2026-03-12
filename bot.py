@@ -1,25 +1,30 @@
-#!/usr/bin/env python 
-import os, re, sys, random, logging, asyncio, string, base64, json, html, hashlib 
-from datetime import datetime, timedelta 
-from typing import Optional, List, Tuple 
-from urllib.parse import urlparse 
-# Optional dependency for external APIs 
+#!/usr/bin/env python
+import os, re, sys, random, logging, asyncio, string, base64, json, html, hashlib
+from datetime import datetime, timedelta
+from typing import Optional, List, Tuple
+from urllib.parse import urlparse
+
+# Optional dependency for external APIs
 try:
     import requests
 except ImportError:
     requests = None
+
 from telegram import (
     Update, ChatPermissions, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand
 )
 from telegram.helpers import escape_markdown
 import telegram
+
 from starlette.applications import Starlette
 from starlette.requests import Request
 from starlette.responses import JSONResponse, PlainTextResponse, Response
 from starlette.routing import Route
+
 # ------------- Logging -------------
 logging.basicConfig(format="%(asctime)s %(levelname)s %(name)s %(message)s", level=logging.INFO)
 logger = logging.getLogger("safeguard-bot")
+
 # ------------- Environment (keep only secrets & deployment knobs) -------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()}
@@ -27,41 +32,50 @@ WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 BASE_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
 WEBHOOK_PATH = "/webhook"
 WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}" if BASE_URL else ""
+
 # API keys (optional but recommended)
 VT_API_KEY = os.getenv("VT_API_KEY", "")
 GSB_API_KEY = os.getenv("GSB_API_KEY", "")
 PERSPECTIVE_API_KEY = os.getenv("PERSPECTIVE_API_KEY", "")
 ABUSEIPDB_API_KEY = os.getenv("ABUSEIPDB_API_KEY", "")
+
 # Vault & bot message cleanup controls (kept in env for operational flexibility)
-VAULT_CHANNEL_ID = int(os.getenv("VAULT_CHANNEL_ID", "0") or "0")  # e.g., -1001234567890
+VAULT_CHANNEL_ID = int(os.getenv("VAULT_CHANNEL_ID", "0") or "0")   # e.g., -1001234567890
 AUTO_DELETE_BOT_MSGS = os.getenv("AUTO_DELETE_BOT_MSGS", "1").lower() in ("1", "true", "yes")
 BOT_MSG_TTL = int(os.getenv("BOT_MSG_TTL", "60"))  # seconds; used in groups for benign/info msgs
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing.")
+
 # ---- API endpoints ----
 VT_BASE = "https://www.virustotal.com/api/v3"
 GSB_LOOKUP = "https://safebrowsing.googleapis.com/v4/threatMatches:find"
 ABUSEIPDB_CHECK = "https://api.abuseipdb.com/api/v2/check"
 PERSPECTIVE_ANALYZE = "https://commentanalyzer.googleapis.com/v1alpha1/comments:analyze"
+
 # ------------- Fixed policy thresholds & defaults (in code) -------------
 BAD_WORDS = {"idiot", "stupid", "fool"}
-BLOCK_LINKS = False  # Default allow links but screen for malicious
+BLOCK_LINKS = False               # Default allow links but screen for malicious
 WARN_LIMIT = 2
 FLOOD_MAX_MSG = 5
 FLOOD_WINDOW_SEC = 10
 MUTE_SECONDS = 60
+
 TOXICITY_THRESHOLD = 0.85
 SEVERE_TOXICITY_THRESHOLD = 0.75
 INSULT_THRESHOLD = 0.85
 THREAT_THRESHOLD = 0.60
 ABUSEIPDB_CONFIDENCE_MIN = 75
+
 PERSPECTIVE_MIN_INTERVAL = 1.0
+
 ENGINES_FOR_PROGRESS = [
     "Kaspersky","Avast","BitDefender","ESET-NOD32","Microsoft","Sophos","TrendMicro",
     "McAfee","DrWeb","Fortinet","ClamAV","Paloalto","Malwarebytes","VIPRE"
 ]
 DEFAULT_TOP_ENGINES = ["Microsoft", "Kaspersky", "BitDefender"]
-TOP_ENGINES = DEFAULT_TOP_ENGINES[:]
+TOP_ENGINES = DEFAULT_TOP_ENGINES[:]  # Change here if you want different engines
+
 # ---- Runtime state (in-memory only; no persistence) ----
 PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
 PENDING_JOIN = {}     # token -> {"chat_id": ..., "user_id": ...}
@@ -70,10 +84,13 @@ USER_MSG_TIMES = {}   # (chat_id, user_id) -> timestamps
 UNVERIFIED = set()    # {(chat_id, user_id)}
 BOT_USERNAME = None   # filled at startup
 SESSION_USERNAMES: dict[int, Optional[str]] = {}
+
 _last_perspective_call_ts = 0.0
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
+
 
 # ------------- Defang / Deobfuscation + URL/Domain extraction -------------
 ZERO_WIDTH_CHARS = r'[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]'
@@ -106,7 +123,7 @@ def deobfuscate_text(text: str) -> str:
 
 # ---- Safe regex (single-quoted raw strings) ----
 URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\']+')
-DOMAIN_SIMPLE = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
+DOMAIN_SIMPLE   = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
 TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
 
 def extract_urls_and_domains(text: str) -> List[str]:
@@ -115,15 +132,15 @@ def extract_urls_and_domains(text: str) -> List[str]:
     t = deobfuscate_text(text)
     urls = set()
     for m in URL_WITH_SCHEME.finditer(t):
-        urls.add(m.group(0).rstrip(".),;!?'\"]"))
+        urls.add(m.group(0).rstrip(").,;!?'\"]"))
     for m in DOMAIN_SIMPLE.finditer(t):
-        raw = m.group(0).rstrip(".),;!?'\"]")
+        raw = m.group(0).rstrip(").,;!?'\"]")
         if not re.match(r'(?i)^(?:https?|ftp)://', raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
     for m in TELEGRAM_DOMAIN.finditer(t):
-        raw = m.group(0).rstrip(".),;!?'\"]")
+        raw = m.group(0).rstrip(").,;!?'\"]")
         if not raw.startswith("http"):
             urls.add("http://" + raw)
         else:
@@ -131,7 +148,7 @@ def extract_urls_and_domains(text: str) -> List[str]:
     for m in re.finditer(r'(?i)@\w{5,}', t):
         username = m.group(0)[1:]
         urls.add(f"https://t.me/{username}")
-    normalized = [u.rstrip(".),;!?'\"]") for u in urls]
+    normalized = [u.rstrip(").,;!?'\"]") for u in urls]
     return normalized[:20]
 
 def extract_ips(text: str, urls: List[str]) -> List[str]:
@@ -155,8 +172,8 @@ def extract_ips(text: str, urls: List[str]) -> List[str]:
             uniq.append(ip); seen.add(ip)
     return uniq[:20]
 
-# ------------- External checks -------------
 
+# ------------- External checks -------------
 def vt_url_id(url: str) -> str:
     raw = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
     return raw
@@ -242,6 +259,7 @@ async def analyze_toxicity(text: str) -> Optional[dict]:
     except Exception:
         return None
 
+
 # ------------- Helpers (async) -------------
 async def delete_message_safe(update: Update, context):
     try:
@@ -312,8 +330,8 @@ async def send_ephemeral(context, chat_id: int, text: str, *, parse_mode=None, r
         logger.debug(f"send_ephemeral cleanup plan failed: {e}")
     return m
 
-# ------------- Custom welcome message builder -------------
 
+# ------------- Custom welcome message builder -------------
 def build_welcome_message(name: str) -> str:
     return (
         f"👋 Welcome {name}! This bot helps keep our community safe and secure.\n\n"
@@ -329,11 +347,14 @@ def build_welcome_message(name: str) -> str:
         "✅ Developed by CCU Teams of MPTC."
     )
 
+
 # ------------- Incident response -------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
     if severity in ("medium","high","critical"):
         await delete_message_safe(update, context)
+
     total = add_warning(chat_id, user.id)
+
     if severity == "low":
         await send_ephemeral(context, chat_id, f"⚠️ {reason}. Please avoid posting risky content, @{user.username or user.first_name}.")
     elif severity == "medium":
@@ -344,10 +365,12 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
     else:
         await send_ephemeral(context, chat_id, f"⛔ {reason}. You are muted for {MUTE_SECONDS*3}s.", delay=MUTE_SECONDS)
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS*3))
+
     try:
         await notify_admins(context, f"🔎 Security action\n• Chat: {chat_id}\n• UID: {user.id}\n• Reason: {reason}\n• Severity: {severity}")
     except Exception:
         pass
+
 
 # ------------- Diagnostics -------------
 async def log_all_updates(update: Update, context):
@@ -368,6 +391,7 @@ async def log_all_updates(update: Update, context):
     if update.chat_join_request: types.append("chat_join_request")
     logger.info(f"UPDATE TYPES: {types}")
 
+
 # ------------- Commands -------------
 async def cmd_start(update: Update, context):
     payload = None
@@ -375,12 +399,14 @@ async def cmd_start(update: Update, context):
         parts = update.message.text.strip().split(maxsplit=1)
         if len(parts) == 2 and parts[0] == "/start":
             payload = parts[1].strip()
+
     if payload and payload.startswith("join-"):
         token = payload.split("join-", 1)[1].strip()
         pending = PENDING_JOIN.get(token)
         if not pending:
             await send_ephemeral(context, update.effective_chat.id, "⚠️ Verification link is invalid or expired. Please request to join again.")
             return
+
         correct = random.randint(1, 4)
         options = list(range(1, 5)); random.shuffle(options)
         keyboard = [[InlineKeyboardButton(str(n), callback_data=f"verify_join:{token}:{int(n==correct)}")] for n in options]
@@ -388,6 +414,7 @@ async def cmd_start(update: Update, context):
         # Keep interactive message (no auto-delete)
         await context.bot.send_message(update.effective_chat.id, "🔐 Please solve the CAPTCHA to join the group. Pick the correct number:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
+
     name = f"{update.effective_user.first_name or ''} {update.effective_user.last_name or ''}".strip() or (f"@{update.effective_user.username}" if update.effective_user.username else str(update.effective_user.id))
     await send_ephemeral(context, update.effective_chat.id, build_welcome_message(name))
 
@@ -439,7 +466,7 @@ async def cmd_function(update: Update, context):
     text = (
         "🛠 **Safeguard Bot Functions**\n\n"
         "**General (Private & Group)**\n"
-        "• /start, /rules, /report <reason>, /warnings, /scan <url>\n\n"
+        "• /start, /rules, /report <reason>, /warnings\n\n"
         "**Moderation (Group)**\n"
         "• Offensive word filter • Link blocking • Flood control • Delete violations\n\n"
         "**Verification (Group)**\n"
@@ -451,35 +478,6 @@ async def cmd_function(update: Update, context):
     )
     await send_ephemeral(context, update.effective_chat.id, text, parse_mode="Markdown")
 
-async def cmd_scan(update: Update, context):
-    """Explicit URL scan command that ALWAYS replies in private and group chats."""
-    args = context.args if getattr(context, "args", None) else []
-    if not args:
-        await send_ephemeral(context, update.effective_chat.id, "Usage: /scan <url or text containing URLs>")
-        return
-    text = " ".join(args)
-    urls = extract_urls_and_domains(text)
-    if not urls:
-        await send_ephemeral(context, update.effective_chat.id, "I couldn't find any URLs in your input.")
-        return
-    gsb_bad, gsb_detail = check_google_safebrowsing(urls)
-    vt_bad, vt_detail = check_virustotal_url(urls[0])
-    ips = extract_ips(text, urls)
-    ip_lines = []
-    if ips and ABUSEIPDB_API_KEY:
-        for ip in ips[:5]:
-            bad, detail, score = check_abuseipdb_ip(ip)
-            flag = "⚠️" if bad else "✅"
-            ip_lines.append(f"{flag} {ip}: {detail}")
-    lines = [
-        "🔗 URL Scan Result",
-        f"• Target: {urls[0]}",
-        (f"• Google Safe Browsing: {'⚠️ ' + gsb_detail if gsb_bad else '✅ ' + gsb_detail}" if GSB_API_KEY else "• Google Safe Browsing: (not configured)"),
-        (f"• VirusTotal: {'⚠️ ' + vt_detail if vt_bad else '✅ ' + vt_detail}" if VT_API_KEY else "• VirusTotal: (not configured)"),
-    ]
-    if ip_lines:
-        lines.append("• IP reputation (AbuseIPDB):\n  " + "\n  ".join(ip_lines))
-    await context.bot.send_message(update.effective_chat.id, "\n".join(lines), disable_web_page_preview=True)
 
 # ------------- Admin policy controls -------------
 async def enforce_admin_violation(update: Update, context, action_label: str):
@@ -521,6 +519,7 @@ async def togglelinks(update: Update, context):
     BLOCK_LINKS = not BLOCK_LINKS
     await send_ephemeral(context, update.effective_chat.id, f"Link policy: {'BLOCK ALL LINKS' if BLOCK_LINKS else 'ALLOW LINKS (malicious ones are auto-removed)'}.")
 
+
 # ------------- Gate -------------
 async def gate_unverified(update: Update, context):
     chat = update.effective_chat
@@ -534,26 +533,28 @@ async def gate_unverified(update: Update, context):
         except Exception:
             pass
 
+
 # ------------- Moderation -------------
 async def moderate(update: Update, context):
     msg = update.effective_message
     user = msg.from_user
     chat_id = update.effective_chat.id
     text = (msg.text or msg.caption or "")
+
     try:
         SESSION_USERNAMES[user.id] = user.username
     except Exception:
         pass
-    # IMPORTANT CHANGE: Only bypass admins in groups, not in private
-    if is_admin(user.id) and update.effective_chat.type in ("group", "supergroup"):
+
+    if is_admin(user.id):
         return
-    # Flood control
+
     if record_user_message(chat_id, user.id) > FLOOD_MAX_MSG:
         await delete_message_safe(update, context)
         await send_ephemeral(context, chat_id, f"⌛ Slow down, @{user.username or user.first_name} (muted {MUTE_SECONDS}s).", delay=MUTE_SECONDS)
         await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=MUTE_SECONDS))
         return
-    # Toxicity (optional)
+
     if PERSPECTIVE_API_KEY and len(text) >= 10:
         scores = await analyze_toxicity(text)
         if scores:
@@ -565,7 +566,7 @@ async def moderate(update: Update, context):
                 reason = f"Toxic content detected (tox={tox:.2f}, severe={sev:.2f}, insult={ins:.2f}, threat={thr:.2f})"
                 await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
                 return
-    # Bad words
+
     if any(bad in text.lower() for bad in BAD_WORDS):
         await delete_message_safe(update, context)
         total = add_warning(chat_id, user.id)
@@ -575,6 +576,7 @@ async def moderate(update: Update, context):
         else:
             await send_ephemeral(context, chat_id, f"⚠️ Warning ({total}/{WARN_LIMIT}). Avoid offensive language.", delay=MUTE_SECONDS)
         return
+
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
     if urls:
@@ -588,8 +590,9 @@ async def moderate(update: Update, context):
             severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
             await auto_mitigate(update, context, user, chat_id, " ; ".join(reasons), severity=severity)
             return
-        # 2) Optional classroom mode: blanket block even if clean (group/supergroup only)
-        if BLOCK_LINKS and update.effective_chat.type in ("group", "supergroup"):
+
+        # 2) Optional classroom mode: blanket block even if clean
+        if BLOCK_LINKS:
             await delete_message_safe(update, context)
             await send_ephemeral(
                 context,
@@ -599,6 +602,7 @@ async def moderate(update: Update, context):
             )
             add_warning(chat_id, user.id)
             return
+
         # 3) IP reputation check still applies (AbuseIPDB)
         ips = extract_ips(text, urls)
         if ips and ABUSEIPDB_API_KEY:
@@ -612,19 +616,7 @@ async def moderate(update: Update, context):
                 reason = f"IP reputation bad: {worst[0]} (confidence={worst[1]}) via AbuseIPDB"
                 await auto_mitigate(update, context, user, chat_id, reason, severity="high")
                 return
-        # 4) NEW: In PRIVATE chats, always show a benign summary so users get feedback
-        if update.effective_chat.type == "private":
-            lines = ["🔗 URL Scan Result (private)"]
-            if GSB_API_KEY:
-                lines.append("• Google Safe Browsing: ✅ no matches" if not gsb_bad else f"• Google Safe Browsing: ⚠️ {gsb_detail}")
-            else:
-                lines.append("• Google Safe Browsing: (not configured)")
-            if VT_API_KEY:
-                lines.append("• VirusTotal: ✅ clean/undetected" if not vt_bad else f"• VirusTotal: ⚠️ {vt_detail}")
-            else:
-                lines.append("• VirusTotal: (not configured)")
-            await context.bot.send_message(chat_id, "\n".join(lines), disable_web_page_preview=True)
-    # (No message for benign text in groups to avoid noise)
+
 
 # ------------- Join alert + CAPTCHA (Post-join) -------------
 async def welcome_verify(update: Update, context):
@@ -642,6 +634,7 @@ async def welcome_verify(update: Update, context):
         # Auto-delete the extra welcome banner to reduce noise in groups:
         await send_ephemeral(context, chat_id, build_welcome_message(name))
 
+
 # ------------- Join Request (Pre-join verification) -------------
 async def handle_join_request(update: Update, context):
     req = update.chat_join_request
@@ -657,8 +650,8 @@ async def handle_join_request(update: Update, context):
     except Exception:
         pass
 
-# ------------ VT helpers for 409/rescan & large files ------------
 
+# ------------ VT helpers for 409/rescan & large files ------------
 def sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -687,8 +680,8 @@ async def _vt_request_rescan_by_hash(headers: dict, sha256: str) -> Optional[str
         logger.warning(f"VT rescan request error: {e}")
         return None
 
-# ------------- VirusTotal file scanning (with robust 409/large-file handling) -------------
 
+# ------------- VirusTotal file scanning (with robust 409/large-file handling) -------------
 def _normalize(s: str) -> str:
     return re.sub(r'[\s_\-]+', '', (s or '')).lower()
 
@@ -722,10 +715,13 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
         await progress_msg.edit_text("❌ 'requests' not installed. Add it to requirements.txt and redeploy."); return
     if not VT_API_KEY:
         await progress_msg.edit_text("❌ VirusTotal API key (VT_API_KEY) not configured."); return
+
     headers = {"x-apikey": VT_API_KEY}
     sha256 = sha256_file(file_path)
     size_bytes = file_size_bytes(file_path)
+
     # Decide upload method per VT docs: /files for <=32MB, upload_url for >32MB
+    # (If >32MB we must first GET /files/upload_url, then POST to that URL.) [1](https://docs.virustotal.com/reference/files-scan)[2](https://docs.virustotal.com/reference/files-upload-url)
     upload_url = None
     try:
         if size_bytes > 32 * 1024 * 1024:
@@ -736,6 +732,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                 logger.warning(f"VT upload_url failed: status={r.status_code}, body={r.text[:200]}")
     except Exception as e:
         logger.warning(f"VT upload_url error: {e}")
+
     # Try upload-or-rescan logic
     try:
         with open(file_path, "rb") as f:
@@ -743,13 +740,14 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                 resp = requests.post(upload_url, headers=headers, files={"file": f}, timeout=60)
             else:
                 resp = requests.post(f"{VT_BASE}/files", headers=headers, files={"file": f}, timeout=60)
+
         if resp.status_code in (200, 201):
             analysis_id = resp.json().get("data", {}).get("id")
             if not analysis_id:
                 await progress_msg.edit_text("❌ Failed to get analysis ID from VirusTotal."); return
             await progress_msg.edit_text("✅ File uploaded! Scanning in progress...")
         elif resp.status_code == 409:
-            # Already submitted: request a rescan by hash and proceed.
+            # Already submitted: request a rescan by hash and proceed. [3](https://docs.virustotal.com/reference/files-analyse)
             analysis_id = await _vt_request_rescan_by_hash(headers, sha256)
             if analysis_id:
                 await progress_msg.edit_text("♻️ File already exists on VirusTotal. Requested re‑analysis...")
@@ -758,13 +756,16 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                 return
         else:
             # Other errors
-            await progress_msg.edit_text(f"❌ Upload error: {resp.status_code} {resp.reason}")
+            await progress_msg.edit_text(f"❌ Upload error: {resp.status_code} {resp.reason} for url: {resp.url}")
             return
+
     except Exception as e:
         await progress_msg.edit_text(f"❌ Upload error: {escape_markdown(str(e), version=2)}", parse_mode="MarkdownV2"); return
+
     # Poll analysis until completion
     idx, prev, attempts, max_attempts = 0, None, 0, 120
     summary_message_id = None
+
     while attempts < max_attempts:
         await asyncio.sleep(5)
         try:
@@ -776,17 +777,20 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
             if attrs.get("status") == "completed":
                 stats = attrs.get("stats", {}) or {}
                 results = attrs.get("results", {}) or {}
+
                 mal = int(stats.get("malicious", 0))
                 sus = int(stats.get("suspicious", 0))
                 und = int(stats.get("undetected", 0))
                 har = int(stats.get("harmless", 0))
                 total_for_und = (mal + sus + und) if (mal + sus + und) > 0 else und
+
                 chosen = TOP_ENGINES[:3]
                 lines = []
                 for i, eng in enumerate(chosen, start=1):
                     cat, res = _pick_engine_result(results, eng)
                     lines.append(_format_engine_line(i, eng, cat, res))
                 engines_block = "\n".join(lines)
+
                 if (mal > 0) or (sus > 0):
                     # Build HTML report (for both group and vault)
                     file_html = html.escape(display_name)
@@ -798,6 +802,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                         f"<pre>Malicious: {mal}\nSuspicious: {sus}\nHarmless: {har}\nUndetected: {und}/{total_for_und}</pre>\n"
                         f"🧪 <b>Top Engines</b>:\n<pre>{engines_html}</pre>"
                     )
+
                     # 1) Forward to vault (if configured), then delete original group message
                     vault_forward_msg = None
                     try:
@@ -809,12 +814,15 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                             )
                     except Exception as e:
                         logger.warning(f"Vault forward failed: {e}")
+
                     try:
                         await context.bot.delete_message(src_chat_id, src_message_id)
                     except Exception as e:
                         logger.warning(f"Delete malicious src message failed: {e}")
-                    # 2) Persistent report in the group/private chat
+
+                    # 2) Persistent report in the group
                     await progress_msg.edit_text(report_html, parse_mode="HTML", disable_web_page_preview=True)
+
                     # 3) Also post a report in the VAULT channel (so the forwarded file has context)
                     try:
                         if VAULT_CHANNEL_ID:
@@ -838,8 +846,9 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                             )
                     except Exception as e:
                         logger.warning(f"Vault report failed: {e}")
+
                 else:
-                    # Benign summary (auto-delete after TTL in groups)
+                    # Benign summary (auto-delete after TTL)
                     summary = (
                         f"✅ **Scan Complete!**\n\n"
                         f"📄 **File:** `{escape_markdown(display_name, version=2)}`\n\n"
@@ -855,19 +864,23 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                     await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
                     summary_message_id = progress_msg.message_id
                     asyncio.create_task(_auto_delete_message(context, chat_id, summary_message_id, delay=BOT_MSG_TTL))
+
                 # Clean up local temp file
                 try:
                     os.remove(file_path)
                 except Exception as e:
                     logger.error(f"Delete temp file failed: {e}")
                 return
+
             banner = f"🔎 Scanning... please wait ({ENGINES_FOR_PROGRESS[idx]})"
             if banner != prev:
                 await progress_msg.edit_text(banner); prev = banner
             idx = (idx + 1) % len(ENGINES_FOR_PROGRESS)
             attempts += 1
+
         except Exception as e:
             logger.error(f"VT status error: {e}"); attempts += 1
+
     await progress_msg.edit_text("⚠️ Scan taking too long. Please check manually on VirusTotal.")
     try: os.remove(file_path)
     except Exception as e: logger.error(f"Delete temp after timeout failed: {e}")
@@ -894,39 +907,6 @@ async def scan_photo(update: Update, context):
         src_chat_id=update.effective_chat.id, src_message_id=update.effective_message.message_id
     )
 
-# NEW: scan video/audio/animation in the same way
-async def scan_video(update: Update, context):
-    video = update.message.video
-    file = await video.get_file()
-    path = await file.download_to_drive()
-    display_name = video.file_name or os.path.basename(path)
-    progress = await context.bot.send_message(update.effective_chat.id, "⏳ Uploading video to VirusTotal and starting scan...")
-    await vt_scan_and_report(
-        path, progress, display_name, context, update.effective_chat.id,
-        src_chat_id=update.effective_chat.id, src_message_id=update.effective_message.message_id
-    )
-
-async def scan_animation(update: Update, context):
-    anim = update.message.animation
-    file = await anim.get_file()
-    path = await file.download_to_drive()
-    display_name = anim.file_name or os.path.basename(path)
-    progress = await context.bot.send_message(update.effective_chat.id, "⏳ Uploading media to VirusTotal and starting scan...")
-    await vt_scan_and_report(
-        path, progress, display_name, context, update.effective_chat.id,
-        src_chat_id=update.effective_chat.id, src_message_id=update.effective_message.message_id
-    )
-
-async def scan_audio(update: Update, context):
-    aud = update.message.audio
-    file = await aud.get_file()
-    path = await file.download_to_drive()
-    display_name = aud.file_name or os.path.basename(path)
-    progress = await context.bot.send_message(update.effective_chat.id, "⏳ Uploading audio to VirusTotal and starting scan...")
-    await vt_scan_and_report(
-        path, progress, display_name, context, update.effective_chat.id,
-        src_chat_id=update.effective_chat.id, src_message_id=update.effective_message.message_id
-    )
 
 # ------------- Verify button (both modes) -------------
 async def verify_callback(update: Update, context):
@@ -978,6 +958,7 @@ async def verify_callback(update: Update, context):
     except Exception as e:
         logger.debug(f"verify_callback error: {e}")
 
+
 # ------------- PTB + Starlette -------------
 from telegram.ext import (
     ApplicationBuilder, MessageHandler, CommandHandler, CallbackQueryHandler,
@@ -991,71 +972,48 @@ builder = (
     .updater(None)
     .defaults(Defaults(block=False))
 )
+
 try:
     builder = builder.rate_limiter(AIORateLimiter())
 except Exception as e:
     logging.warning(f"AIORateLimiter unavailable ({e}); starting without rate limiter.")
+
 application = builder.build()
 bot_for_update = application.bot
 
 # Global error logger
 async def on_error(update: object, context):
     logging.error("Handler error", exc_info=context.error)
+
 application.add_error_handler(on_error)
 
 # ---- Handlers ----
 application.add_handler(MessageHandler(filters.ALL, log_all_updates), group=-1)
-
-# Group-specific gate
 group_chats_filter_v20 = (filters.ChatType.GROUP | filters.ChatType.SUPERGROUP)
 application.add_handler(MessageHandler(group_chats_filter_v20 & filters.ALL, gate_unverified, block=False), group=0)
 
-# Commands
 application.add_handler(CommandHandler("start", cmd_start, block=False), group=1)
 application.add_handler(CommandHandler("rules", cmd_rules, block=False), group=1)
 application.add_handler(CommandHandler("report", cmd_report, block=False), group=1)
 application.add_handler(CommandHandler("warnings", cmd_warnings, block=False), group=1)
 application.add_handler(CommandHandler("function", cmd_function, block=False), group=1)
-application.add_handler(CommandHandler("scan", cmd_scan, block=False), group=1)
 
 # Admin-only commands
 application.add_handler(CommandHandler("ping", cmd_ping, block=False), group=1)
 application.add_handler(CommandHandler("diagnose", cmd_diagnose, block=False), group=1)
-application.add_handler(CommandHandler("addbadword", addbadword, block=False), group=1)
-application.add_handler(CommandHandler("removebadword", removebadword, block=False), group=1)
-application.add_handler(CommandHandler("togglelinks", togglelinks, block=False), group=1)
 
-# File scanners (now include more media types)
+# File scanners
 application.add_handler(MessageHandler(filters.Document.ALL, scan_document, block=False), group=1)
 application.add_handler(MessageHandler(filters.PHOTO, scan_photo, block=False), group=1)
-application.add_handler(MessageHandler(filters.VIDEO, scan_video, block=False), group=1)
-application.add_handler(MessageHandler(filters.ANIMATION, scan_animation, block=False), group=1)
-application.add_handler(MessageHandler(filters.AUDIO, scan_audio, block=False), group=1)
 
 # Post-join & pre-join
 application.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, welcome_verify), group=1)
 application.add_handler(ChatJoinRequestHandler(handle_join_request), group=1)
 
-# Unified verification callback (FIXED PATTERN)
+# Unified verification callback (fixed pattern)
 application.add_handler(CallbackQueryHandler(verify_callback, pattern=r'^(verify:|verify_join:)'), group=1)
 
-# PRIVATE chat URL feedback handler — ALWAYS reply so users get confirmation
-async def private_scan_text(update: Update, context):
-    msg = update.effective_message
-    text = (msg.text or msg.caption or "")
-    urls = extract_urls_and_domains(text)
-    if not urls:
-        return
-    gsb_bad, gsb_detail = check_google_safebrowsing(urls)
-    vt_bad, vt_detail = check_virustotal_url(urls[0]) if urls else (False, "")
-    lines = ["🔗 URL Scan Result (private)"]
-    lines.append(f"• Google Safe Browsing: {'⚠️ ' + gsb_detail if gsb_bad else ('✅ ' + gsb_detail if GSB_API_KEY else '(not configured)')}")
-    lines.append(f"• VirusTotal: {'⚠️ ' + vt_detail if vt_bad else ('✅ ' + vt_detail if VT_API_KEY else '(not configured)')}")
-    await context.bot.send_message(update.effective_chat.id, "\n".join(lines), disable_web_page_preview=True)
-
-application.add_handler(MessageHandler(filters.ChatType.PRIVATE & (filters.TEXT | filters.CAPTION) & ~filters.COMMAND, private_scan_text), group=1)
-
-# Moderation (text/caption)
+# Moderation
 application.add_handler(MessageHandler((filters.TEXT | filters.CAPTION) & ~filters.COMMAND, moderate), group=1)
 
 # ---- Command tap (optional log) ----
@@ -1085,7 +1043,6 @@ async def set_my_commands():
             BotCommand("report","Report an issue to admins"),
             BotCommand("warnings","Show your warnings"),
             BotCommand("function","Show all bot functions"),
-            BotCommand("scan","Scan a URL (private & groups)"),
             BotCommand("ping","Quick connectivity test (admins only)"),
             BotCommand("diagnose","Show bot permissions & config (admins only)"),
         ]
@@ -1125,8 +1082,10 @@ async def main():
     logging.info(f"Starting Uvicorn on 0.0.0.0:{port}")
     config = uvicorn.Config(app=app, host="0.0.0.0", port=port, workers=1, log_level="info")
     server = uvicorn.Server(config)
+
     await application.initialize()
     await application.start()
+
     global BOT_USERNAME
     try:
         me = await application.bot.get_me()
@@ -1134,6 +1093,7 @@ async def main():
         logging.info(f"BOT_USERNAME resolved: {BOT_USERNAME}")
     except Exception as e:
         logging.warning(f"Failed to resolve BOT_USERNAME: {e}")
+
     try:
         if WEBHOOK_URL:
             if WEBHOOK_SECRET and re.match(r'^[A-Za-z0-9_\-]{1,256}$', WEBHOOK_SECRET):
@@ -1150,8 +1110,10 @@ async def main():
             logging.warning("WEBHOOK_URL empty; skipping set_webhook.")
     except Exception as e:
         logging.error(f"set_webhook failed: {e}")
+
     await set_my_commands()
     await server.serve()
+
     await application.stop()
     await application.shutdown()
 
