@@ -94,14 +94,17 @@ def is_admin(user_id: int) -> bool:
 
 
 
-# Trailing punctuation/closing tokens stripper for URLs/domains
-_TRAIL_RE = re.compile(r"[\]\)\.,;!?'"\s]+$")
+# Trailing punctuation/closing tokens stripper for URLs/domains (non-regex version)
+TRAILING_CHARS = set(")]
+	
+ .,!?:;'" ")  # includes common punctuation, quotes, spaces
 
 def strip_trailing_punct(s: str) -> str:
-    try:
-        return _TRAIL_RE.sub('', s or '')
-    except Exception:
-        return s or ''
+    s = s or ""
+    i = len(s) - 1
+    while i >= 0 and s[i] in TRAILING_CHARS:
+        i -= 1
+    return s[: i + 1]
 # ------------- Defang / Deobfuscation + URL/Domain extraction -------------
 ZERO_WIDTH_CHARS = r'[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]'
 ZERO_WIDTH_PATTERN = re.compile(ZERO_WIDTH_CHARS)
@@ -136,39 +139,31 @@ URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\']+')
 DOMAIN_SIMPLE   = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
 TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
 
-
 def extract_urls_and_domains(text: str) -> List[str]:
-    """Extract real URLs/domains from message text.
-    - DOES NOT turn @mentions into t.me links (prevents false positives).
-    - Keeps explicit Telegram links (t.me / telegram.me) so policy can allow/skip them.
-    """
     if not text:
         return []
     t = deobfuscate_text(text)
-    urls: set[str] = set()
-
-    # 1) Full URLs with scheme
+    urls = set()
     for m in URL_WITH_SCHEME.finditer(t):
-        urls.add(strip_trailing_punct(m.group(0)))
-
-    # 2) Bare domains (example.com/path)
+        urls.add(m.group(0).rstrip(").,;!?'\"]"))
     for m in DOMAIN_SIMPLE.finditer(t):
-        raw = strip_trailing_punct(m.group(0))
+        raw = m.group(0).rstrip(").,;!?'\"]")
         if not re.match(r'(?i)^(?:https?|ftp)://', raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-
-    # 3) Explicit Telegram domains
     for m in TELEGRAM_DOMAIN.finditer(t):
-        raw = strip_trailing_punct(m.group(0))
+        raw = m.group(0).rstrip(").,;!?'\"]")
         if not raw.startswith("http"):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-
-    normalized = [strip_trailing_punct(u) for u in urls]
+    for m in re.finditer(r'(?i)@\w{5,}', t):
+        username = m.group(0)[1:]
+        urls.add(f"https://t.me/{username}")
+    normalized = [u.rstrip(").,;!?'\"]") for u in urls]
     return normalized[:20]
+
 def extract_ips(text: str, urls: List[str]) -> List[str]:
     t = deobfuscate_text(text or "")
     ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', t)
