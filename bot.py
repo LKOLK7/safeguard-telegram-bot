@@ -95,9 +95,8 @@ def is_admin(user_id: int) -> bool:
 
 
 # Trailing punctuation/closing tokens stripper for URLs/domains (non-regex version)
-TRAILING_CHARS = set(")]
-	
- .,!?:;'" ")  # includes common punctuation, quotes, spaces
+TRAILING_CHARS = set(")]}.,;!?:;'" 	
+")
 
 def strip_trailing_punct(s: str) -> str:
     s = s or ""
@@ -147,13 +146,13 @@ def extract_urls_and_domains(text: str) -> List[str]:
     for m in URL_WITH_SCHEME.finditer(t):
         urls.add(m.group(0).rstrip(").,;!?'\"]"))
     for m in DOMAIN_SIMPLE.finditer(t):
-        raw = m.group(0).rstrip(").,;!?'\"]")
+        raw = strip_trailing_punct(m.group(0)).,;!?'\"]")
         if not re.match(r'(?i)^(?:https?|ftp)://', raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
     for m in TELEGRAM_DOMAIN.finditer(t):
-        raw = m.group(0).rstrip(").,;!?'\"]")
+        raw = strip_trailing_punct(m.group(0)).,;!?'\"]")
         if not raw.startswith("http"):
             urls.add("http://" + raw)
         else:
@@ -161,7 +160,7 @@ def extract_urls_and_domains(text: str) -> List[str]:
     for m in re.finditer(r'(?i)@\w{5,}', t):
         username = m.group(0)[1:]
         urls.add(f"https://t.me/{username}")
-    normalized = [u.rstrip(").,;!?'\"]") for u in urls]
+    normalized = [strip_trailing_punct(u) for u in urls]") for u in urls]
     return normalized[:20]
 
 def extract_ips(text: str, urls: List[str]) -> List[str]:
