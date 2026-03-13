@@ -350,18 +350,25 @@ def build_welcome_message(name: str) -> str:
 
 # ------------- Incident response -------------
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    """Unified incident popup used everywhere; dynamic Action/Evidence, 60s mute; send to admins & vault.
-"""
+    """Unified incident popup; dynamic Action/Evidence, 60s mute; send to admins & vault.
+    - Evidence shows the *real malicious link* when provided as reason starting with "malicious_link:".
+    - Incident banner is NOT auto-deleted in group/bot (delay=0).
+    """
     await delete_message_safe(update, context)
     add_warning(chat_id, user.id)
+
     rlow = (reason or '').lower()
     action = 'Policy violation'
     evidence = 'violation'
-    if rlow.startswith('banned_keyword:'):
+
+    if rlow.startswith('malicious_link:'):
+        action = 'Posted malicious link'
+        evidence = reason.split(':', 1)[1].strip() or 'malicious link'
+    elif rlow.startswith('banned_keyword:'):
         word = reason.split(':', 1)[1].strip() if ':' in reason else '***'
         action = 'Posted banned keyword'
         evidence = f'"{word}" (offensive language)'
-    elif '[gsb]' in rlow or 'safe browsing' in rlow or 'safebrowsing' in rlow or 'http' in rlow or 'https' in rlow or '[vt]' in rlow or 'virustotal' in rlow:
+    elif '[gsb]' in rlow or 'safe browsing' in rlow or 'safebrowsing' in rlow or '[vt]' in rlow or 'virustotal' in rlow:
         action = 'Posted malicious link'
         evidence = 'malicious link'
     elif 'abuseipdb' in rlow or 'ip reputation' in rlow:
@@ -370,25 +377,25 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
     elif 'toxic content' in rlow or 'tox=' in rlow or 'insult=' in rlow or 'threat=' in rlow:
         action = 'Posted toxic message'
         evidence = 'toxic message'
+
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (f"@{user.username}" if user.username else str(user.id))
     user_tag = f" (@{user.username})" if user.username else ''
+
     popup = f"""🚨 INCIDENT DETECTED
-
 • User: {full_name}{user_tag}
-
 • Action: {action}
-
 • Risk Level: HIGH
-
 • Response: Message removed, user muted 60 seconds
-
 • Evidence: {evidence}"""
-    await send_ephemeral(context, chat_id, popup)
+
+    await send_ephemeral(context, chat_id, popup, delay=0)
     await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=60))
+
     try:
         await notify_admins(context, popup)
     except Exception:
         pass
+
     try:
         if VAULT_CHANNEL_ID:
             await context.bot.send_message(VAULT_CHANNEL_ID, popup)
@@ -589,16 +596,27 @@ async def moderate(update: Update, context):
                 reason = f"Toxic content detected (tox={tox:.2f}, severe={sev:.2f}, insult={ins:.2f}, threat={thr:.2f})"
                 await auto_mitigate(update, context, user, chat_id, reason, severity="medium")
                 return
+
     # Offensive keyword handling -> route through auto_mitigate with the matched word
+
     lw = (text or '').lower()
+
     bad_hit = None
+
     for _w in BAD_WORDS:
+
         if _w in lw:
+
             bad_hit = _w
+
             break
+
     if bad_hit:
-        await auto_mitigate(update, context, user, chat_id, reason=f"banned_keyword:{bad_hit}", severity="high")
+
+        await auto_mitigate(update, context, user, chat_id, reason="banned_keyword:" + bad_hit, severity="high")
+
         return
+
 
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
@@ -607,11 +625,9 @@ async def moderate(update: Update, context):
         gsb_bad, gsb_detail = check_google_safebrowsing(urls)
         vt_bad, vt_detail = check_virustotal_url(urls[0]) if urls else (False, "")
         if gsb_bad or vt_bad:
-            reasons = []
-            if gsb_bad: reasons.append(f"[GSB] {gsb_detail}")
-            if vt_bad: reasons.append(f"[VT] {vt_detail}")
+            bad_url = urls[0] if urls else ''
             severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
-            await auto_mitigate(update, context, user, chat_id, " ; ".join(reasons), severity=severity)
+            await auto_mitigate(update, context, user, chat_id, reason="malicious_link:" + bad_url, severity=severity)
             return
 
         # 2) Optional classroom mode: blanket block even if clean
