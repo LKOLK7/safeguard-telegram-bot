@@ -92,18 +92,6 @@ def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 
-
-
-# Trailing punctuation/closing tokens stripper for URLs/domains (non-regex version)
-TRAILING_CHARS = set(")]}.,;!?:;'" 	
-")
-
-def strip_trailing_punct(s: str) -> str:
-    s = s or ""
-    i = len(s) - 1
-    while i >= 0 and s[i] in TRAILING_CHARS:
-        i -= 1
-    return s[: i + 1]
 # ------------- Defang / Deobfuscation + URL/Domain extraction -------------
 ZERO_WIDTH_CHARS = r'[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]'
 ZERO_WIDTH_PATTERN = re.compile(ZERO_WIDTH_CHARS)
@@ -146,13 +134,13 @@ def extract_urls_and_domains(text: str) -> List[str]:
     for m in URL_WITH_SCHEME.finditer(t):
         urls.add(m.group(0).rstrip(").,;!?'\"]"))
     for m in DOMAIN_SIMPLE.finditer(t):
-        raw = strip_trailing_punct(m.group(0)).,;!?'\"]")
+        raw = m.group(0).rstrip(").,;!?'\"]")
         if not re.match(r'(?i)^(?:https?|ftp)://', raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
     for m in TELEGRAM_DOMAIN.finditer(t):
-        raw = strip_trailing_punct(m.group(0)).,;!?'\"]")
+        raw = m.group(0).rstrip(").,;!?'\"]")
         if not raw.startswith("http"):
             urls.add("http://" + raw)
         else:
@@ -160,7 +148,7 @@ def extract_urls_and_domains(text: str) -> List[str]:
     for m in re.finditer(r'(?i)@\w{5,}', t):
         username = m.group(0)[1:]
         urls.add(f"https://t.me/{username}")
-    normalized = [strip_trailing_punct(u) for u in urls]") for u in urls]
+    normalized = [u.rstrip(").,;!?'\"]") for u in urls]
     return normalized[:20]
 
 def extract_ips(text: str, urls: List[str]) -> List[str]:
