@@ -126,31 +126,40 @@ URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\']+')
 DOMAIN_SIMPLE   = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
 TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
 
+
 def extract_urls_and_domains(text: str) -> List[str]:
+    """Extract real URLs/domains from message text.
+    - DOES NOT turn @mentions into t.me links (prevents false positives).
+    - Keeps explicit Telegram links (t.me / telegram.me) so policy can allow/skip them.
+    """
     if not text:
         return []
     t = deobfuscate_text(text)
-    urls = set()
+    urls: set[str] = set()
+
+    # 1) Full URLs with scheme
     for m in URL_WITH_SCHEME.finditer(t):
-        urls.add(m.group(0).rstrip(").,;!?'\"]"))
+        urls.add(m.group(0).rstrip(".),;!?'"]"))
+
+    # 2) Bare domains (example.com/path)
     for m in DOMAIN_SIMPLE.finditer(t):
-        raw = m.group(0).rstrip(").,;!?'\"]")
+        raw = m.group(0).rstrip(".),;!?'"]")
         if not re.match(r'(?i)^(?:https?|ftp)://', raw):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
+
+    # 3) Explicit Telegram domains
     for m in TELEGRAM_DOMAIN.finditer(t):
-        raw = m.group(0).rstrip(").,;!?'\"]")
+        raw = m.group(0).rstrip(".),;!?'"]")
         if not raw.startswith("http"):
             urls.add("http://" + raw)
         else:
             urls.add(raw)
-    for m in re.finditer(r'(?i)@\w{5,}', t):
-        username = m.group(0)[1:]
-        urls.add(f"https://t.me/{username}")
-    normalized = [u.rstrip(").,;!?'\"]") for u in urls]
-    return normalized[:20]
 
+    # NOTE: We intentionally DO NOT convert @mentions into URLs.
+    normalized = [u.rstrip(".),;!?'"]") for u in urls]
+    return normalized[:20]
 def extract_ips(text: str, urls: List[str]) -> List[str]:
     t = deobfuscate_text(text or "")
     ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', t)
@@ -620,29 +629,55 @@ async def moderate(update: Update, context):
 
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
+    # Gather Telegram message entities to detect mentions accurately
+    try:
+        entities = (msg.entities or []) + (msg.caption_entities or [])
+    except Exception:
+        entities = msg.entities or []
+    has_telegram_mentions = any(getattr(e, 'type', '') in ('mention', 'text_mention') for e in entities)
+
     if urls:
-        # 1) Always screen links with GSB/VT
-        gsb_bad, gsb_detail = check_google_safebrowsing(urls)
-        vt_bad, vt_detail = check_virustotal_url(urls[0]) if urls else (False, "")
-        if gsb_bad or vt_bad:
-            bad_url = urls[0] if urls else ''
-            severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
-            await auto_mitigate(update, context, user, chat_id, reason="malicious_link:" + bad_url, severity=severity)
+        # Whitelist Telegram domains from scanning & blocking
+        TELEGRAM_HOSTS = {'t.me', 'telegram.me'}
+        def host(u):
+            try:
+                return (urlparse(u).hostname or '').lower()
+            except Exception:
+                return ''
+        non_tg_urls = [u for u in urls if host(u) and not any(host(u).endswith(d) for d in TELEGRAM_HOSTS)]
+
+        # Early‑exit: if ALL URLs are Telegram links, skip checks entirely
+        if urls and not non_tg_urls:
             return
 
-        # 2) Optional classroom mode: blanket block even if clean
-        if BLOCK_LINKS:
+        # 1) Screen only non‑Telegram links with GSB/VT
+        gsb_bad, gsb_detail = (check_google_safebrowsing(non_tg_urls) if non_tg_urls else (False, ''))
+        vt_bad, vt_detail  = (check_virustotal_url(non_tg_urls[0]) if non_tg_urls else (False, ''))
+        if gsb_bad or vt_bad:
+            reasons = []
+            if gsb_bad: reasons.append(f'[GSB] {gsb_detail}')
+            if vt_bad:  reasons.append(f'[VT] {vt_detail}')
+            severity = 'high' if ('MALWARE' in gsb_detail or vt_bad) else 'medium'
+            await auto_mitigate(update, context, user, chat_id, ' ; '.join(reasons), severity=severity)
+            return
+
+        # 2) Optional classroom mode: block only non‑Telegram links
+        if BLOCK_LINKS and non_tg_urls:
             await delete_message_safe(update, context)
             await send_ephemeral(
                 context,
                 chat_id,
-                "🔗 Links are restricted here. If it’s class‑related, ask an admin.",
+                '🔗 Links are restricted here. If it’s class‑related, ask an admin.',
                 delay=MUTE_SECONDS
             )
             add_warning(chat_id, user.id)
             return
+    else:
+        # No URLs extracted; if the message contains only mentions, skip moderation
+        if has_telegram_mentions:
+            return
 
-        # 3) IP reputation check still applies (AbuseIPDB)
+    # 3) IP reputation check still applies (AbuseIPDB)
         ips = extract_ips(text, urls)
         if ips and ABUSEIPDB_API_KEY:
             bad_hits = []
