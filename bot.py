@@ -475,7 +475,7 @@ async def send_ephemeral(context, chat_id: int, text: str, *, parse_mode=None, r
 def build_welcome_message(name: str) -> str:
     return (
         f"👋 Welcome {name}! This bot helps keep our community safe and secure.\n\n"
-        "🔐 **Security Features Enabled:**\n"
+        "🔐 Security Features Enabled:\n"
         "• Post-Join Verification\n"
         "• Link Safety Checks (GSB & VirusTotal)\n"
         "• IP Reputation Monitoring (AbuseIPDB)\n"
@@ -483,7 +483,7 @@ def build_welcome_message(name: str) -> str:
         "• Automated Incident Response\n\n"
         "✅ Please follow the group rules:\n"
         "• Be respectful • No spam • External links only when relevant\n\n"
-        "📌 Use `/report <reason>` to notify admins.\n\n"
+        "📌 Use /report <reason> to notify admins.\n\n"
         "✅ Developed by CCU Teams of MPTC."
     )
 
@@ -663,19 +663,19 @@ async def cmd_diagnose(update: Update, context):
 
 async def cmd_function(update: Update, context):
     text = (
-        "🛠 **Safeguard Bot Functions**\n\n"
-        "**General (Private & Group)**\n"
+        "🛠 Safeguard Bot Functions\n\n"
+        "General (Private & Group)\n"
         "• /start, /rules, /report <reason>, /warnings\n\n"
-        "**Moderation (Group)**\n"
+        "Moderation (Group)\n"
         "• Offensive word filter • Link blocking • Flood control • Delete violations\n\n"
-        "**Verification (Group)**\n"
+        "Verification (Group)\n"
         "• Pre‑join CAPTCHA via Join Requests • Post‑join CAPTCHA\n\n"
-        "**Admin Controls**\n"
+        "Admin Controls\n"
         "• /addbadword, /removebadword, /togglelinks, /ping, /diagnose\n\n"
-        "**Security Scanner**\n"
+        "Security Scanner\n"
         "• URL/IP checks (GSB, VirusTotal, AbuseIPDB) • AI toxicity screening • File/photo VT scan."
     )
-    await send_ephemeral(context, update.effective_chat.id, text, parse_mode="Markdown")
+    await send_ephemeral(context, update.effective_chat.id, text)
 
 # ------------- Admin policy controls -------------
 
@@ -863,8 +863,7 @@ async def welcome_verify(update: Update, context):
         # Keep CAPTCHA visible (interactive)
         await context.bot.send_message(
             chat_id,
-            f"📣 NEW MEMBER ALERT\nPlease verify: pick **{correct}** to unlock chatting.\nUID: `{new_member.id}`",
-            parse_mode="Markdown",
+            f"📣 NEW MEMBER ALERT\nPlease verify: pick {correct} to unlock chatting.\nUID: {new_member.id}",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
         # Auto-delete the extra welcome banner to reduce noise in groups:
@@ -1089,19 +1088,17 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
                         logger.warning(f"Vault report failed: {e}")
                 else:
                     # Benign summary (auto-delete after TTL)
-                    summary = (
-                        f"✅ **Scan Complete!**\n\n"
-                        f"📄 **File:** `{escape_markdown(display_name, version=2)}`\n\n"
-                        f"🔎 **Summary:**\n"
-                        f"• 🛡 **Malicious:** `{mal}`\n"
-                        f"• ⚠️ **Suspicious:** `{sus}`\n"
-                        f"• ✅ **Harmless:** `{har}`\n"
-                        f"• ❓ **Undetected:** `{und}/{total_for_und}`\n\n"
-                        f"🧪 **Virus Engines:**\n"
-                        f"{escape_markdown(engines_block, version=2)}\n\n"
+                    file_html = html.escape(display_name)
+                    engines_html = html.escape(engines_block)
+                    summary_html = (
+                        f"✅ <b>Scan Complete</b>\n\n"
+                        f"📄 <b>File</b>: <code>{file_html}</code>\n\n"
+                        f"🔎 <b>Summary</b>:\n"
+                        f"<pre>Malicious: {mal}\nSuspicious: {sus}\nHarmless: {har}\nUndetected: {und}/{total_for_und}</pre>\n"
+                        f"🧪 <b>Virus Engines</b>:\n<pre>{engines_html}</pre>\n\n"
                         f"🔔 Powered by CCU Teams of MPTC"
                     )
-                    await progress_msg.edit_text(escape_markdown(summary, version=2), parse_mode="MarkdownV2")
+                    await progress_msg.edit_text(summary_html, parse_mode="HTML", disable_web_page_preview=True)
                     summary_message_id = progress_msg.message_id
                     asyncio.create_task(_auto_delete_message(context, chat_id, summary_message_id, delay=BOT_MSG_TTL))
 
