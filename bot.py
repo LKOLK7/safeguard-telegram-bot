@@ -1,7 +1,7 @@
 #!/usr/bin/env python
 import os, re, sys, random, logging, asyncio, string, base64, json, html, hashlib
 from datetime import datetime, timedelta
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 from urllib.parse import urlparse
 
 # Optional dependency for external APIs
@@ -78,20 +78,27 @@ DEFAULT_TOP_ENGINES = ["Microsoft", "Kaspersky", "BitDefender"]
 TOP_ENGINES = DEFAULT_TOP_ENGINES[:]
 
 # ---- Runtime state (in-memory only; no persistence) ----
-PENDING_CAPTCHA = {}  # user_id -> {"chat_id": ..., "answer": ..., "mode": "post"|"pre", "token": ...}
-PENDING_JOIN = {}     # token -> {"chat_id": ..., "user_id": ...}
-USER_WARNINGS = {}    # (chat_id, user_id) -> count
-USER_MSG_TIMES = {}   # (chat_id, user_id) -> timestamps
+PENDING_CAPTCHA: Dict[int, dict] = {}  # user_id -> {chat_id, answer, mode, token}
+PENDING_JOIN: Dict[str, dict] = {}     # token -> {chat_id, user_id}
+USER_WARNINGS: Dict[tuple, int] = {}   # (chat_id, user_id) -> count
+USER_MSG_TIMES: Dict[tuple, List[float]] = {}   # (chat_id, user_id) -> timestamps
 UNVERIFIED = set()    # {(chat_id, user_id)}
-BOT_USERNAME = None   # filled at startup
+BOT_USERNAME: Optional[str] = None     # filled at startup
 SESSION_USERNAMES: dict[int, Optional[str]] = {}
 _last_perspective_call_ts = 0.0
+
+# Caches for URL/Domain reputation to reduce API calls
+VT_URL_CACHE: Dict[str, tuple] = {}      # url -> (bad: bool, detail: str, ts: float)
+VT_DOMAIN_CACHE: Dict[str, tuple] = {}   # host -> (bad: bool, detail: str, ts: float)
+VT_CACHE_TTL_SEC = 15 * 60
+
 
 def is_admin(user_id: int) -> bool:
     return user_id in ADMIN_IDS
 
 # Trailing punctuation/closing tokens stripper for URLs/domains (non-regex version)
 TRAILING_CHARS = set(")]}.,;!?:;'\"")
+
 
 def strip_trailing_punct(s: str) -> str:
     s = s or ""
@@ -104,8 +111,10 @@ def strip_trailing_punct(s: str) -> str:
 ZERO_WIDTH_CHARS = r'[\u200B-\u200F\u202A-\u202E\u2060-\u2064\uFEFF]'
 ZERO_WIDTH_PATTERN = re.compile(ZERO_WIDTH_CHARS)
 
+
 def strip_zero_width(text: str) -> str:
     return ZERO_WIDTH_PATTERN.sub("", text or "")
+
 
 DEFANG_SUBS = [
     (re.compile(r'hxxps', re.I), 'https'),
@@ -122,6 +131,7 @@ DEFANG_SUBS = [
     (re.compile(r'(?i)\b([a-z0-9])\s+(?=[a-z0-9])'), r'\1'),
 ]
 
+
 def deobfuscate_text(text: str) -> str:
     t = strip_zero_width(text)
     for pat, repl in DEFANG_SUBS:
@@ -130,9 +140,10 @@ def deobfuscate_text(text: str) -> str:
     return t
 
 # ---- Safe regex (raw strings) ----
-URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"\']+')
+URL_WITH_SCHEME = re.compile(r'(?i)\b(?:https?|ftp)://[^\s<>"]+')
 DOMAIN_SIMPLE   = re.compile(r'\b(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}(?::\d{2,5})?(?:/[^\s]*)?')
 TELEGRAM_DOMAIN = re.compile(r'(?i)\b(?:t\.me|telegram\.me)(?:/[^\s]*)?')
+
 
 def extract_urls_and_domains(text: str) -> List[str]:
     """Extract URLs from text. DOES NOT convert @username to t.me link (fix)."""
@@ -161,9 +172,7 @@ def extract_urls_and_domains(text: str) -> List[str]:
         else:
             urls.add(raw)
 
-    # --- IMPORTANT FIX ---
-    # Do NOT convert @username mentions to "https://t.me/<username>".
-    # (This used to create false positives by feeding plain mentions into link scanners.)
+    # Do NOT convert @username mentions into t.me links.
 
     # Normalize and cap
     normalized = []
@@ -176,6 +185,7 @@ def extract_urls_and_domains(text: str) -> List[str]:
         if len(normalized) >= 20:
             break
     return normalized
+
 
 def extract_ips(text: str, urls: List[str]) -> List[str]:
     t = deobfuscate_text(text or "")
@@ -200,31 +210,95 @@ def extract_ips(text: str, urls: List[str]) -> List[str]:
     return uniq[:20]
 
 # ------------- External checks -------------
+
 def vt_url_id(url: str) -> str:
     raw = base64.urlsafe_b64encode(url.encode()).decode().rstrip("=")
     return raw
 
+
+def _vt_is_cache_fresh(ts: float) -> bool:
+    return (datetime.now().timestamp() - ts) <= VT_CACHE_TTL_SEC
+
+
 def check_virustotal_url(url: str) -> Tuple[bool, str]:
+    """Check specific URL on VirusTotal. Returns (is_bad, detail).
+    Uses caching and falls back to domain reputation if URL result is clean.
+    """
     if not VT_API_KEY or requests is None:
         return (False, "VT disabled")
+
+    # Cache
+    ent = VT_URL_CACHE.get(url)
+    if ent and _vt_is_cache_fresh(ent[2]):
+        return (ent[0], ent[1])
+
     headers = {"x-apikey": VT_API_KEY}
     try:
         uid = vt_url_id(url)
         g = requests.get(f"{VT_BASE}/urls/{uid}", headers=headers, timeout=8)
         if g.status_code == 404:
+            # submit then re-fetch
             requests.post(f"{VT_BASE}/urls", headers=headers, data={"url": url}, timeout=8)
             g = requests.get(f"{VT_BASE}/urls/{uid}", headers=headers, timeout=8)
         if g.status_code == 200:
             data = g.json().get("data", {}).get("attributes", {})
-            verdicts = data.get("last_analysis_stats", {})
+            verdicts = data.get("last_analysis_stats", {}) or {}
             malicious = int(verdicts.get("malicious", 0))
             suspicious = int(verdicts.get("suspicious", 0))
             if malicious > 0 or suspicious > 0:
-                return (True, f"VirusTotal flags: malicious={malicious}, suspicious={suspicious}")
+                detail = f"[VT] URL flagged: malicious={malicious}, suspicious={suspicious}"
+                VT_URL_CACHE[url] = (True, detail, datetime.now().timestamp())
+                return (True, detail)
+            # Fallback to domain reputation when URL looks clean
+            host = (urlparse(url).hostname or "").lower()
+            if host:
+                d_bad, d_detail = check_virustotal_domain(host)
+                detail = d_detail if d_bad else "VirusTotal: clean/undetected"
+                VT_URL_CACHE[url] = (d_bad, detail, datetime.now().timestamp())
+                return (d_bad, detail)
+            VT_URL_CACHE[url] = (False, "VirusTotal: clean/undetected", datetime.now().timestamp())
             return (False, "VirusTotal: clean/undetected")
-        return (False, f"VirusTotal: status={g.status_code}")
+        detail = f"VirusTotal: status={g.status_code}"
+        VT_URL_CACHE[url] = (False, detail, datetime.now().timestamp())
+        return (False, detail)
     except Exception as e:
-        return (False, f"VirusTotal error: {e}")
+        detail = f"VirusTotal error: {e}"
+        VT_URL_CACHE[url] = (False, detail, datetime.now().timestamp())
+        return (False, detail)
+
+
+def check_virustotal_domain(host: str) -> Tuple[bool, str]:
+    """Check domain reputation on VirusTotal as a fallback. Returns (is_bad, detail)."""
+    if not VT_API_KEY or requests is None:
+        return (False, "VT disabled")
+
+    ent = VT_DOMAIN_CACHE.get(host)
+    if ent and _vt_is_cache_fresh(ent[2]):
+        return (ent[0], ent[1])
+
+    headers = {"x-apikey": VT_API_KEY}
+    try:
+        r = requests.get(f"{VT_BASE}/domains/{host}", headers=headers, timeout=8)
+        if r.status_code == 200:
+            attr = r.json().get("data", {}).get("attributes", {})
+            stats = attr.get("last_analysis_stats", {}) or {}
+            mal = int(stats.get("malicious", 0))
+            sus = int(stats.get("suspicious", 0))
+            cats = attr.get("categories", {}) or {}
+            bad = (mal > 0 or sus > 0)
+            detail = f"[VT] Domain flagged: malicious={mal}, suspicious={sus}, categories={','.join(sorted(cats.values())) or '-'}"
+            if not bad:
+                detail = f"VirusTotal domain clean: malicious={mal}, suspicious={sus}"
+            VT_DOMAIN_CACHE[host] = (bad, detail, datetime.now().timestamp())
+            return (bad, detail)
+        detail = f"VirusTotal domain: status={r.status_code}"
+        VT_DOMAIN_CACHE[host] = (False, detail, datetime.now().timestamp())
+        return (False, detail)
+    except Exception as e:
+        detail = f"VirusTotal domain error: {e}"
+        VT_DOMAIN_CACHE[host] = (False, detail, datetime.now().timestamp())
+        return (False, detail)
+
 
 def check_google_safebrowsing(urls: List[str]) -> Tuple[bool, str]:
     if not GSB_API_KEY or requests is None or not urls:
@@ -250,6 +324,7 @@ def check_google_safebrowsing(urls: List[str]) -> Tuple[bool, str]:
     except Exception as e:
         return (False, f"Safe Browsing error: {e}")
 
+
 def check_abuseipdb_ip(ip: str) -> Tuple[bool, str, int]:
     if not ABUSEIPDB_API_KEY or requests is None:
         return (False, "AbuseIPDB disabled", 0)
@@ -266,6 +341,7 @@ def check_abuseipdb_ip(ip: str) -> Tuple[bool, str, int]:
         return (False, f"AbuseIPDB: status={r.status_code}", 0)
     except Exception as e:
         return (False, f"AbuseIPDB error: {e}", 0)
+
 
 async def analyze_toxicity(text: str) -> Optional[dict]:
     global _last_perspective_call_ts
@@ -296,6 +372,7 @@ async def delete_message_safe(update: Update, context):
     except Exception as e:
         logger.warning(f"Delete failed: {e}")
 
+
 async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
     perms = ChatPermissions(
         can_send_messages=False, can_send_polls=False, can_send_other_messages=False,
@@ -306,6 +383,7 @@ async def restrict_user(chat_id: int, user_id: int, context, until_date=None):
         await context.bot.restrict_chat_member(chat_id, user_id, permissions=perms, until_date=until_date)
     except Exception as e:
         logger.warning(f"Restrict failed: {e}")
+
 
 async def unrestrict_user(chat_id: int, user_id: int, context):
     perms = ChatPermissions(
@@ -318,10 +396,12 @@ async def unrestrict_user(chat_id: int, user_id: int, context):
     except Exception as e:
         logger.warning(f"Unrestrict failed: {e}")
 
+
 def add_warning(chat_id: int, user_id: int) -> int:
     key = (chat_id, user_id)
     USER_WARNINGS[key] = USER_WARNINGS.get(key, 0) + 1
     return USER_WARNINGS[key]
+
 
 def record_user_message(chat_id: int, user_id: int) -> int:
     key = (chat_id, user_id)
@@ -331,6 +411,7 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     USER_MSG_TIMES[key] = [t for t in times if now - t <= FLOOD_WINDOW_SEC]
     return len(USER_MSG_TIMES[key])
 
+
 async def notify_admins(context, text: str, parse_mode=None):
     for admin_id in ADMIN_IDS:
         try:
@@ -338,12 +419,14 @@ async def notify_admins(context, text: str, parse_mode=None):
         except Exception:
             pass
 
+
 async def _auto_delete_message(context, chat_id: int, message_id: int, delay: int = 60):
     try:
         await asyncio.sleep(delay)
         await context.bot.delete_message(chat_id, message_id)
     except Exception as e:
         logger.debug(f"auto-delete failed: {e}")
+
 
 async def send_ephemeral(context, chat_id: int, text: str, *, parse_mode=None, reply_markup=None, delay: int = None):
     """Sends a bot message and schedules auto-delete in groups unless disabled."""
@@ -360,6 +443,7 @@ async def send_ephemeral(context, chat_id: int, text: str, *, parse_mode=None, r
     return m
 
 # ------------- Custom welcome message builder -------------
+
 def build_welcome_message(name: str) -> str:
     return (
         f"👋 Welcome {name}! This bot helps keep our community safe and secure.\n\n"
@@ -376,6 +460,7 @@ def build_welcome_message(name: str) -> str:
     )
 
 # ------------- Incident response -------------
+
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
     """Unified incident popup; dynamic Action/Evidence, 60s mute; send to admins & vault."""
     await delete_message_safe(update, context)
@@ -426,6 +511,7 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
         logger.warning(f'Vault post failed: {e}')
 
 # ------------- Diagnostics -------------
+
 async def log_all_updates(update: Update, context):
     types = []
     if update.message: types.append("message")
@@ -445,6 +531,7 @@ async def log_all_updates(update: Update, context):
     logger.info(f"UPDATE TYPES: {types}")
 
 # ------------- Commands -------------
+
 async def cmd_start(update: Update, context):
     payload = None
     if update.message and update.message.text:
@@ -469,8 +556,10 @@ async def cmd_start(update: Update, context):
     name = f"{update.effective_user.first_name or ''} {update.effective_user.last_name or ''}".strip() or (f"@{update.effective_user.username}" if update.effective_user.username else str(update.effective_user.id))
     await send_ephemeral(context, update.effective_chat.id, build_welcome_message(name))
 
+
 async def cmd_rules(update: Update, context):
     await send_ephemeral(context, update.effective_chat.id, "Group rules:\n• Be respectful.\n• No profanity or harassment.\n• Avoid spam & unsolicited ads.\n• External links only when relevant.\n• Follow lecturer’s guidance.")
+
 
 async def cmd_report(update: Update, context):
     reason = " ".join(context.args) if getattr(context, "args", None) else "(no reason provided)"
@@ -481,16 +570,19 @@ async def cmd_report(update: Update, context):
         except Exception:
             pass
 
+
 async def cmd_warnings(update: Update, context):
     count = USER_WARNINGS.get((update.effective_chat.id, update.effective_user.id), 0)
     await send_ephemeral(context, update.effective_chat.id, f"Your current warnings: {count}")
 
 # --- Admin-only commands ---
+
 async def cmd_ping(update: Update, context):
     if not is_admin(update.effective_user.id):
         await enforce_admin_violation(update, context, "use admin-only commands (/ping)")
         return
     await send_ephemeral(context, update.effective_chat.id, "🏓 pong")
+
 
 async def cmd_diagnose(update: Update, context):
     if not is_admin(update.effective_user.id):
@@ -513,6 +605,7 @@ async def cmd_diagnose(update: Update, context):
     except Exception as e:
         await send_ephemeral(context, chat_id, f"Diagnose error: {e}")
 
+
 async def cmd_function(update: Update, context):
     text = (
         "🛠 **Safeguard Bot Functions**\n\n"
@@ -530,6 +623,7 @@ async def cmd_function(update: Update, context):
     await send_ephemeral(context, update.effective_chat.id, text, parse_mode="Markdown")
 
 # ------------- Admin policy controls -------------
+
 async def enforce_admin_violation(update: Update, context, action_label: str):
     user_id = update.effective_user.id
     chat_id = update.effective_chat.id
@@ -541,6 +635,7 @@ async def enforce_admin_violation(update: Update, context, action_label: str):
     else:
         await send_ephemeral(context, chat_id, f"⚠️ You are not allowed to {action_label}. Warning ({total}/{WARN_LIMIT}).\nFurther violations may result in a temporary mute.", delay=MUTE_SECONDS)
 
+
 async def addbadword(update: Update, context):
     if not is_admin(update.effective_user.id):
         await enforce_admin_violation(update, context, "change bot settings (/addbadword)"); return
@@ -549,6 +644,7 @@ async def addbadword(update: Update, context):
     for w in context.args:
         BAD_WORDS.add(w.lower())
     await send_ephemeral(context, update.effective_chat.id, f"Added: {', '.join(context.args)}")
+
 
 async def removebadword(update: Update, context):
     if not is_admin(update.effective_user.id):
@@ -562,6 +658,7 @@ async def removebadword(update: Update, context):
             BAD_WORDS.remove(wl); removed.append(w)
     await send_ephemeral(context, update.effective_chat.id, f"Removed: {', '.join(removed) if removed else '(none)'}")
 
+
 async def togglelinks(update: Update, context):
     if not is_admin(update.effective_user.id):
         await enforce_admin_violation(update, context, "change bot settings (/togglelinks)"); return
@@ -570,6 +667,7 @@ async def togglelinks(update: Update, context):
     await send_ephemeral(context, update.effective_chat.id, f"Link policy: {'BLOCK ALL LINKS' if BLOCK_LINKS else 'ALLOW LINKS (malicious ones are auto-removed)'}.")
 
 # ------------- Gate -------------
+
 async def gate_unverified(update: Update, context):
     chat = update.effective_chat
     user = update.effective_user
@@ -583,12 +681,15 @@ async def gate_unverified(update: Update, context):
             pass
 
 # ------------- Moderation -------------
+
+
 def is_telegram_link(u: str) -> bool:
     try:
         host = (urlparse(u).hostname or "").lower()
         return host.endswith("t.me") or host.endswith("telegram.me")
     except Exception:
         return False
+
 
 async def moderate(update: Update, context):
     msg = update.effective_message
@@ -636,20 +737,34 @@ async def moderate(update: Update, context):
     # --- URL/IP moderation logic (allow links, but screen for malicious) ---
     urls = extract_urls_and_domains(text)
     if urls:
-        # Only scan NON-Telegram links
+        # Only scan NON-Telegram links; check all URLs, not just the first
         urls_to_scan = [u for u in urls if not is_telegram_link(u)]
 
+        flagged_url = None
+        flagged_detail = ""
+
         if urls_to_scan:
-            # 1) Always screen links with GSB/VT
+            # 1) Screen links with GSB (all URLs)
             gsb_bad, gsb_detail = check_google_safebrowsing(urls_to_scan)
-            vt_bad, vt_detail = check_virustotal_url(urls_to_scan[0]) if urls_to_scan else (False, "")
-            if gsb_bad or vt_bad:
-                bad_url = urls_to_scan[0]
-                severity = "high" if ("MALWARE" in gsb_detail or vt_bad) else "medium"
-                await auto_mitigate(update, context, user, chat_id, reason="malicious_link:" + bad_url, severity=severity)
+            if gsb_bad:
+                flagged_url = urls_to_scan[0]
+                flagged_detail = gsb_detail
+
+            # 2) VirusTotal URL/Domain check for each URL until one flags
+            if not flagged_url:
+                for u in urls_to_scan:
+                    vt_bad, vt_detail = check_virustotal_url(u)
+                    if vt_bad:
+                        flagged_url = u
+                        flagged_detail = vt_detail
+                        break
+
+            if flagged_url:
+                severity = "high" if ("MALWARE" in flagged_detail.upper() or "flagged" in flagged_detail.lower()) else "medium"
+                await auto_mitigate(update, context, user, chat_id, reason="malicious_link:" + flagged_url, severity=severity)
                 return
 
-        # 2) Optional classroom mode: blanket block even if clean
+        # 3) Optional blanket block mode
         if BLOCK_LINKS:
             await delete_message_safe(update, context)
             await send_ephemeral(
@@ -661,7 +776,7 @@ async def moderate(update: Update, context):
             add_warning(chat_id, user.id)
             return
 
-    # 3) IP reputation check still applies (AbuseIPDB)
+    # 4) IP reputation check (AbuseIPDB)
     ips = extract_ips(text, urls)
     if ips and ABUSEIPDB_API_KEY:
         bad_hits = []
@@ -676,6 +791,7 @@ async def moderate(update: Update, context):
             return
 
 # ------------- Join alert + CAPTCHA (Post-join) -------------
+
 async def welcome_verify(update: Update, context):
     chat_id = update.effective_chat.id
     for new_member in update.message.new_chat_members:
@@ -700,6 +816,7 @@ async def welcome_verify(update: Update, context):
         await send_ephemeral(context, chat_id, build_welcome_message(name))
 
 # ------------- Join Request (Pre-join verification) -------------
+
 async def handle_join_request(update: Update, context):
     req = update.chat_join_request
     chat_id = req.chat.id
@@ -720,6 +837,7 @@ async def handle_join_request(update: Update, context):
         pass
 
 # ------------ VT helpers for 409/rescan & large files ------------
+
 def sha256_file(path: str) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
@@ -727,14 +845,18 @@ def sha256_file(path: str) -> str:
             h.update(chunk)
     return h.hexdigest()
 
+
 def file_size_bytes(path: str) -> int:
     try:
         return os.path.getsize(path)
     except Exception:
         return 0
 
+
 async def _vt_request_rescan_by_hash(headers: dict, sha256: str) -> Optional[str]:
-    """POST /files/{sha256}/analyse -> returns analysis id on success."""
+    """
+    POST /files/{sha256}/analyse -> returns analysis id on success.
+    """
     try:
         r = requests.post(f"{VT_BASE}/files/{sha256}/analyse", headers=headers, timeout=15)
         if r.status_code == 200:
@@ -747,8 +869,10 @@ async def _vt_request_rescan_by_hash(headers: dict, sha256: str) -> Optional[str
         return None
 
 # ------------- VirusTotal file scanning (with robust 409/large-file handling) -------------
+
 def _normalize(s: str) -> str:
     return re.sub(r'[\s_\-]+', '', (s or '')).lower()
+
 
 def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, Optional[str]]:
     if not results:
@@ -770,10 +894,12 @@ def _pick_engine_result(results: dict, target_engine: str) -> Tuple[str, Optiona
     result = det.get("result")
     return (category, result)
 
+
 def _format_engine_line(rank: int, engine_name: str, category: str, result: Optional[str]) -> str:
     detected = (category in ("malicious", "suspicious"))
     status = f"Detected ({result})" if detected and result else ("Detected" if detected else "Clean")
     return f"- Top {rank}: {engine_name} – {status}"
+
 
 async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, context, chat_id: int, *, src_chat_id: int, src_message_id: int):
     if requests is None:
@@ -945,6 +1071,7 @@ async def vt_scan_and_report(file_path: str, progress_msg, display_name: str, co
     except Exception as e:
         logger.error(f"Delete temp after timeout failed: {e}")
 
+
 async def scan_document(update: Update, context):
     doc = update.message.document
     file = await doc.get_file()
@@ -955,6 +1082,7 @@ async def scan_document(update: Update, context):
         path, progress, display_name, context, update.effective_chat.id,
         src_chat_id=update.effective_chat.id, src_message_id=update.effective_message.message_id
     )
+
 
 async def scan_photo(update: Update, context):
     photo = update.message.photo[-1]
@@ -968,6 +1096,7 @@ async def scan_photo(update: Update, context):
     )
 
 # ------------- Verify button (both modes) -------------
+
 async def verify_callback(update: Update, context):
     q = update.callback_query; await q.answer()
     try:
@@ -1133,6 +1262,7 @@ routes = [
 app = Starlette(routes=routes)
 
 # ---- Misc helpers ----
+
 def gen_token(length: int = 22) -> str:
     alphabet = string.ascii_letters + string.digits
     return ''.join(random.choice(alphabet) for _ in range(length))
@@ -1178,6 +1308,7 @@ async def main():
 
     await application.stop()
     await application.shutdown()
+
 
 if __name__ == "__main__":
     asyncio.run(main())
