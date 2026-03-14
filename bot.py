@@ -437,10 +437,13 @@ def record_user_message(chat_id: int, user_id: int) -> int:
     return len(USER_MSG_TIMES[key])
 
 
-async def notify_admins(context, text: str, parse_mode=None):
+async def notify_admins(context, text: str, parse_mode=None, disable_web_page_preview=None):
     for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(admin_id, text, parse_mode=parse_mode)
+            if disable_web_page_preview is None:
+                await context.bot.send_message(admin_id, text, parse_mode=parse_mode)
+            else:
+                await context.bot.send_message(admin_id, text, parse_mode=parse_mode, disable_web_page_preview=disable_web_page_preview)
         except Exception:
             pass
 
@@ -532,18 +535,18 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
     await send_ephemeral(context, chat_id, popup, parse_mode="HTML", delay=0, disable_web_page_preview=True)
     await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=60))
 
-    # Admins get original evidence (if any)
+    # Admins get original evidence (formatted like vault header, clickable link & preview)
     try:
         if original_url:
             admin_note = (
-                f"🚨 [ADMIN COPY]\n"
-                f"• Chat: {chat_id}\n"
-                f"• User: {full_name}{user_tag}\n"
-                f"• Evidence (original): {original_url}"
+                f"🧯 <b>[ADMIN COPY]</b>\n"
+                f"• <b>Chat</b>: <code>{chat_id}</code>\n"
+                f"• <b>User</b>: {html.escape(full_name)}{user_tag}\n"
+                f"• <b>Evidence (original)</b>: {original_url}"
             )
-            await notify_admins(context, admin_note)
+            await notify_admins(context, admin_note, parse_mode="HTML", disable_web_page_preview=False)
         else:
-            await notify_admins(context, popup, parse_mode="HTML")
+            await notify_admins(context, popup, parse_mode="HTML", disable_web_page_preview=True)
     except Exception:
         pass
 
