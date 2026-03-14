@@ -209,6 +209,31 @@ def extract_ips(text: str, urls: List[str]) -> List[str]:
             uniq.append(ip); seen.add(ip)
     return uniq[:20]
 
+# --- Safe evidence rendering (defang) ---
+
+def defang_for_display(url: str) -> str:
+    """Render URL in non-clickable form for group-visible messages."""
+    ZW = "\u2060"  # zero-width word joiner
+    try:
+        from urllib.parse import urlparse
+        p = urlparse(url)
+        scheme = 'hxxps' if (p.scheme or '').lower() == 'https' else ('hxxp' if p.scheme else '')
+        host = (p.hostname or '').replace('.', '[.]')
+        port = f":{p.port}" if p.port else ''
+        def nz(s: str) -> str:
+            s = (s or '')
+            s = s.replace('.', '[.]')
+            s = s.replace('/', '/' + ZW).replace(':', ':' + ZW).replace('?', '?' + ZW).replace('#', '#' + ZW)
+            return s
+        safe_path = nz(p.path)
+        safe_query = nz('?' + p.query) if p.query else ''
+        safe_frag  = nz('#' + p.fragment) if p.fragment else ''
+        if scheme:
+            return f"{scheme}://{host}{port}{safe_path}{safe_query}{safe_frag}"
+        return url.replace('https', 'hxxps').replace('http', 'hxxp').replace('.', '[.]')
+    except Exception:
+        return url.replace('https', 'hxxps').replace('http', 'hxxp').replace('.', '[.]')
+
 # ------------- External checks -------------
 
 def vt_url_id(url: str) -> str:
@@ -428,9 +453,9 @@ async def _auto_delete_message(context, chat_id: int, message_id: int, delay: in
         logger.debug(f"auto-delete failed: {e}")
 
 
-async def send_ephemeral(context, chat_id: int, text: str, *, parse_mode=None, reply_markup=None, delay: int = None):
+async def send_ephemeral(context, chat_id: int, text: str, *, parse_mode=None, reply_markup=None, delay: int = None, disable_web_page_preview: bool = False):
     """Sends a bot message and schedules auto-delete in groups unless disabled."""
-    m = await context.bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup)
+    m = await context.bot.send_message(chat_id, text, parse_mode=parse_mode, reply_markup=reply_markup, disable_web_page_preview=disable_web_page_preview)
     try:
         if delay is None:
             delay = BOT_MSG_TTL
@@ -462,17 +487,22 @@ def build_welcome_message(name: str) -> str:
 # ------------- Incident response -------------
 
 async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str, severity: str = "medium"):
-    """Unified incident popup; dynamic Action/Evidence, 60s mute; send to admins & vault."""
+    """Unified incident popup; dynamic Action/Evidence, 60s mute; send to admins & vault.
+    - Group-facing evidence is defanged (non-clickable).
+    - Admins/Vault receive the original evidence when applicable.
+    """
     await delete_message_safe(update, context)
     add_warning(chat_id, user.id)
 
     rlow = (reason or '').lower()
     action = 'Policy violation'
     evidence = 'violation'
+    original_url = None
 
     if rlow.startswith('malicious_link:'):
         action = 'Posted malicious link'
-        evidence = reason.split(':', 1)[1].strip() or 'malicious link'
+        original_url = reason.split(':', 1)[1].strip() or None
+        evidence = defang_for_display(original_url) if original_url else 'malicious link'
     elif rlow.startswith('banned_keyword:'):
         word = reason.split(':', 1)[1].strip() if ':' in reason else '***'
         action = 'Posted banned keyword'
@@ -489,24 +519,46 @@ async def auto_mitigate(update: Update, context, user, chat_id: int, reason: str
 
     full_name = f"{user.first_name or ''} {user.last_name or ''}".strip() or (f"@{user.username}" if user.username else str(user.id))
     user_tag = f" (@{user.username})" if user.username else ''
-    popup = f"""🚨 INCIDENT DETECTED
-• User: {full_name}{user_tag}
-• Action: {action}
-• Risk Level: HIGH
-• Response: Message removed, user muted 60 seconds
-• Evidence: {evidence}"""
+    popup = (
+        f"🚨 INCIDENT DETECTED\n"
+        f"• User: {full_name}{user_tag}\n"
+        f"• Action: {action}\n"
+        f"• Risk Level: HIGH\n"
+        f"• Response: Message removed, user muted 60 seconds\n"
+        f"• Evidence: <code>{html.escape(evidence)}</code>"
+    )
 
-    await send_ephemeral(context, chat_id, popup, delay=0)
+    # Group-visible banner: defanged evidence, HTML mode, no previews
+    await send_ephemeral(context, chat_id, popup, parse_mode="HTML", delay=0, disable_web_page_preview=True)
     await restrict_user(chat_id, user.id, context, until_date=datetime.now() + timedelta(seconds=60))
 
+    # Admins get original evidence (if any)
     try:
-        await notify_admins(context, popup)
+        if original_url:
+            admin_note = (
+                f"🚨 [ADMIN COPY]\n"
+                f"• Chat: {chat_id}\n"
+                f"• User: {full_name}{user_tag}\n"
+                f"• Evidence (original): {original_url}"
+            )
+            await notify_admins(context, admin_note)
+        else:
+            await notify_admins(context, popup, parse_mode="HTML")
     except Exception:
         pass
 
+    # Vault gets popup plus original (non-clickable in body, original appended separately)
     try:
         if VAULT_CHANNEL_ID:
-            await context.bot.send_message(VAULT_CHANNEL_ID, popup)
+            if original_url:
+                await context.bot.send_message(
+                    VAULT_CHANNEL_ID,
+                    popup + f"\n\n<b>Original URL:</b> <code>{html.escape(original_url)}</code>",
+                    parse_mode="HTML",
+                    disable_web_page_preview=True
+                )
+            else:
+                await context.bot.send_message(VAULT_CHANNEL_ID, popup, parse_mode="HTML", disable_web_page_preview=True)
     except Exception as e:
         logger.warning(f'Vault post failed: {e}')
 
